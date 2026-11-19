@@ -215,7 +215,7 @@ func TestUsageIsPricedRecordedAndObserved(t *testing.T) {
 	h.call(MethodUsageHandle, claudeRecord("req-1", at, 12, 34))
 	// An API key credential and another provider do not count.
 	apiKey := claudeRecord("req-2", at, 99, 99)
-	apiKey["AuthType"] = "api_key"
+	apiKey["AuthType"] = "apikey"
 	h.call(MethodUsageHandle, apiKey)
 	codex := claudeRecord("req-3", at, 99, 99)
 	codex["Provider"] = "codex"
