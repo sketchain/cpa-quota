@@ -221,6 +221,8 @@ func (m *Manager) trackLocked(authIndex string) bool {
 	}
 	m.settings = normalized
 	m.loaded.Store(&normalized)
+	// The next refresh estimates the new account at once.
+	m.lastRefresh = time.Time{}
 	return true
 }
 
@@ -575,10 +577,30 @@ func accountStatus(snap *snapshot, latest map[string]Observation, authIndex stri
 // current is the latest snapshot, or an empty one built from the settings
 // before the first refresh, so reads always describe every tracked account.
 func (m *Manager) current() (*snapshot, bool) {
-	if snap := m.snap.Load(); snap != nil {
-		return snap, true
-	}
 	settings := *m.loaded.Load()
+	if snap := m.snap.Load(); snap != nil {
+		missing := false
+		for index := range settings.Accounts {
+			if _, ok := snap.settings.Accounts[index]; !ok {
+				missing = true
+			}
+		}
+		if !missing {
+			return snap, true
+		}
+		// Accounts tracked since the snapshot read as not estimated yet.
+		merged := *snap
+		merged.settings.Accounts = settings.Accounts
+		merged.accounts = make(map[string]accountSnapshot, len(settings.Accounts))
+		for index := range settings.Accounts {
+			account, ok := snap.accounts[index]
+			if !ok {
+				account = accountSnapshot{k: KEstimate{Basis: KBasisNone}}
+			}
+			merged.accounts[index] = account
+		}
+		return &merged, true
+	}
 	snap := &snapshot{settings: settings, accounts: map[string]accountSnapshot{}, weights: map[string]weightsSnapshot{}}
 	for _, index := range settings.authIndexes() {
 		snap.accounts[index] = accountSnapshot{k: KEstimate{Basis: KBasisNone}}
