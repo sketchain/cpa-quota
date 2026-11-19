@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-quota",
+      "name": "CPA Quota",
+      "description": "Estimates Claude and ChatGPT subscription quota in USD and serves it over an API, storing everything in PostgreSQL.",
+      "author": "sketchain",
+      "repository": "https://github.com/sketchain/cpa-quota",
+      "license": "MIT",
+      "tags": ["quota", "claude", "codex", "postgresql"]
+    }
+  ]
+}
