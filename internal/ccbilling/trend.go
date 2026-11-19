@@ -1,9 +1,8 @@
 package ccbilling
 
 import (
+	"context"
 	"database/sql"
-	"fmt"
-	"slices"
 	"time"
 )
 
@@ -62,15 +61,12 @@ type Trend struct {
 func (m *Manager) Trend(authIndex string) (Trend, bool, error) {
 	snap := m.snap.Load()
 	var settings Settings
-	switch {
-	case snap != nil:
+	if snap != nil {
 		settings = snap.settings
-	case m.loaded.Load() != nil:
+	} else {
 		settings = *m.loaded.Load()
-	default:
-		return Trend{}, false, fmt.Errorf("Split estimates are not loaded")
 	}
-	if !slices.Contains(settings.authIndexes(), authIndex) {
+	if _, ok := settings.Accounts[authIndex]; !ok {
 		return Trend{}, false, nil
 	}
 	params := settings.accountParams(authIndex)
@@ -84,17 +80,14 @@ func (m *Manager) Trend(authIndex string) (Trend, bool, error) {
 		RetentionDays: params.SegmentRetentionDays, KMinWeeklyPoints: params.KMinWeeklyPoints, Exclusion: ExclusionRaw, Basis: BasisRaw,
 		Buckets: []KBucket{}, Segments: []TrendHour{}}
 	var segments []Segment
-	// The host's database, not withDB: that would create or migrate tables
-	// when the database changed. Settings were loaded, so the tables exist.
-	err := m.host.WithDB(func(db *sql.DB) error {
-		if db == nil {
-			return fmt.Errorf("The billing database is not open")
-		}
+	// The host's database, not withDB: that would drop the refresh's caches
+	// and needs the refresh lock.
+	err := m.host.WithDB(m.DBTimeout, func(ctx context.Context, db *sql.DB) error {
 		var err error
-		if segments, err = loadSegments(db, authIndex, trend.From); err != nil {
+		if segments, err = loadSegments(ctx, db, m.Instance, authIndex, trend.From); err != nil {
 			return err
 		}
-		buckets, err := loadKBuckets(db, authIndex, trend.From)
+		buckets, err := loadKBuckets(ctx, db, m.Instance, authIndex, trend.From)
 		if buckets != nil {
 			trend.Buckets = buckets
 		}
@@ -113,8 +106,7 @@ func (m *Manager) Trend(authIndex string) (Trend, bool, error) {
 		}
 		excluded = SegmentExclusions(segments, params, snap.at)
 		trend.Exclusion = ExclusionEstimate
-		latest, _ := m.live(snap)
-		status = accountStatus(snap, latest, authIndex, now)
+		status = accountStatus(snap, m.live(), authIndex, now)
 	} else {
 		status = ResolveAccount(authIndex, settings.Accounts[authIndex], Estimate{}, KEstimate{Basis: KBasisNone}, Observation{}, params, now)
 	}
@@ -138,4 +130,69 @@ func (m *Manager) Trend(authIndex string) (Trend, bool, error) {
 		item.Gain += segment.Gain
 	}
 	return trend, true, nil
+}
+
+// TrendDay sums an account's k evidence and segments of one day. K is the
+// day's 5-hour gain over its 7-day gain, nil when the day has no 7-day gain;
+// CostUSD and Gain cover the segments the estimate kept.
+type TrendDay struct {
+	Day              string   `json:"day"`
+	Gain5h           float64  `json:"gain_5h"`
+	Gain7d           float64  `json:"gain_7d"`
+	K                *float64 `json:"k,omitempty"`
+	Segments         int      `json:"segments"`
+	ExcludedSegments int      `json:"excluded_segments"`
+	CostUSD          float64  `json:"cost_usd"`
+	Gain             float64  `json:"gain"`
+}
+
+// dailyTrend splits an account's hourly k buckets and segments into days of
+// location, oldest first. excluded marks the segments the estimate excluded.
+func dailyTrend(buckets []KBucket, segments []Segment, excluded []bool, location *time.Location) []TrendDay {
+	days := map[string]*TrendDay{}
+	day := func(at time.Time) *TrendDay {
+		key := at.In(location).Format(time.DateOnly)
+		entry := days[key]
+		if entry == nil {
+			entry = &TrendDay{Day: key}
+			days[key] = entry
+		}
+		return entry
+	}
+	for _, bucket := range buckets {
+		entry := day(bucket.At)
+		entry.Gain5h += bucket.Gain5h
+		entry.Gain7d += bucket.Gain7d
+	}
+	for i, segment := range segments {
+		entry := day(segment.At)
+		if i < len(excluded) && excluded[i] {
+			entry.ExcludedSegments++
+			continue
+		}
+		entry.Segments++
+		entry.CostUSD += segment.CostUSD
+		entry.Gain += segment.Gain
+	}
+	result := make([]TrendDay, 0, len(days))
+	for _, key := range sortedKeys(days) {
+		entry := *days[key]
+		if entry.Gain7d > gainEpsilon && entry.Gain5h > gainEpsilon {
+			k := entry.Gain5h / entry.Gain7d
+			entry.K = &k
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+// TrendDays is an account's daily trend as of the latest snapshot; false when
+// the account is not tracked or no snapshot exists.
+func (m *Manager) TrendDays(authIndex string) ([]TrendDay, bool) {
+	snap := m.snap.Load()
+	if snap == nil {
+		return nil, false
+	}
+	account, ok := snap.accounts[authIndex]
+	return account.trend, ok
 }

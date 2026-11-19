@@ -1,43 +1,24 @@
 package ccbilling
 
 import (
-	"database/sql"
+	"context"
 	"math"
 	"reflect"
 	"testing"
 	"time"
 )
 
-// fillHost stores a simulation's reports and costs as the billing tables do.
+// fillHost stores a simulation's reports and costs as the plugin records them.
 func fillHost(t *testing.T, host *fakeHost, sim *simulation, authIndex string) {
 	t.Helper()
-	tx, err := host.db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var id int64
+	f := newFacts(t, host)
 	for _, obs := range sim.obs {
-		id++
-		for _, row := range []struct {
-			seconds int64
-			used    float64
-			reset   time.Time
-		}{{18000, obs.Used5h, obs.Reset5h}, {604800, obs.Used7d, obs.Reset7d}} {
-			if _, err := tx.Exec(`INSERT INTO quota_report_windows VALUES (?, 'unified', ?, ?, 'claude', ?, ?, ?)`,
-				id, row.seconds, authIndex, nanos(obs.At), row.used, nanos(row.reset)); err != nil {
-				t.Fatal(err)
-			}
-		}
+		f.report(authIndex, ProviderClaude, obs.At, "", claudeWindows(obs)...)
 	}
 	for _, cost := range sim.costs {
-		if _, err := tx.Exec(`INSERT INTO request_events (at, auth_index, latency_ms, total_cost, currency, billing_model) VALUES (?, ?, 0, ?, 'USD', ?)`,
-			nanos(cost.At), authIndex, cost.USD, cost.Model); err != nil {
-			t.Fatal(err)
-		}
+		f.request(authIndex, ProviderClaude, cost.At, 0, cost.USD, cost.Model, true, true)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
+	f.flush()
 }
 
 func weightedHost(t *testing.T) (*Manager, *fakeHost) {
@@ -50,15 +31,12 @@ func weightedHostWith(t *testing.T, mix func(int) []float64) (*Manager, *fakeHos
 	sim := newSimulation(11, 40, 8)
 	sim.runMixed(30, []string{"claude-sonnet", "claude-opus"}, []mixedModel{{name: "claude-fable", weight: 4}}, mix, sporadicOutside)
 	fillHost(t, host, sim, "a1")
-	manager := NewManager(host)
-	manager.RefreshInterval = 0
-	manager.ProcessBudget = time.Minute
-	return manager, host
+	return newTestManager(host), host
 }
 
 func storedSegments(t *testing.T, host *fakeHost, authIndex string) []Segment {
 	t.Helper()
-	segments, err := loadSegments(host.db, authIndex, time.Time{})
+	segments, err := loadSegments(context.Background(), host.db, testInstance, authIndex, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,13 +46,10 @@ func storedSegments(t *testing.T, host *fakeHost, authIndex string) []Segment {
 func TestWeightsSwitchConvertsOnlyWhenOn(t *testing.T) {
 	manager, host := weightedHost(t)
 	settings := DefaultSettings()
-	settings.Pools = []Pool{{ID: "p", AuthIndexes: []string{"a1"}}}
 	editWeights(&settings, ProviderClaude, func(w *WeightSettings) {
 		w.Items = []WeightItem{{ID: "fable", Name: "Fable", Models: []string{"claude-fable"}}}
 	})
-	if _, err := manager.SetSettings(settings); err != nil {
-		t.Fatal(err)
-	}
+	configure(t, manager, settings, AccountSettings{}, "a1")
 	segments := storedSegments(t, host, "a1")
 	if len(segments) < 1000 {
 		t.Fatalf("segments = %d", len(segments))
@@ -106,9 +81,7 @@ func TestWeightsSwitchConvertsOnlyWhenOn(t *testing.T) {
 	}
 
 	editWeights(&settings, ProviderClaude, func(w *WeightSettings) { w.Enabled = true })
-	if _, err := manager.SetSettings(settings); err != nil {
-		t.Fatal(err)
-	}
+	configure(t, manager, settings, AccountSettings{}, "a1")
 	snap = manager.snap.Load()
 	account = snap.accounts["a1"]
 	factors := map[string]float64{"claude-fable": snap.weights[ProviderClaude].effective[0].Multiplier}
@@ -124,21 +97,22 @@ func TestWeightsSwitchConvertsOnlyWhenOn(t *testing.T) {
 	if !ok || on.For(ProviderClaude).Basis != BasisWeighted || on.Accounts["a1"].Ratio != account.weighted.Ratio || len(on.For(ProviderClaude).Weights) != 1 {
 		t.Fatalf("estimates = %+v", on)
 	}
-	view, err := manager.View()
-	if err != nil {
-		t.Fatal(err)
+	weights := weightsViews(snap, manager.live(), host.now)[ProviderClaude]
+	if len(weights.Comparison) != 1 || weights.Comparison[0].Raw.Ratio != account.raw.Ratio ||
+		weights.Comparison[0].Weighted.Ratio != account.weighted.Ratio || len(weights.Models) != 3 {
+		t.Fatalf("weights view = %+v", weights)
 	}
-	if len(view.Weights[ProviderClaude].Comparison) != 1 || view.Weights[ProviderClaude].Comparison[0].Raw.Ratio != account.raw.Ratio ||
-		view.Weights[ProviderClaude].Comparison[0].Weighted.Ratio != account.weighted.Ratio || len(view.Weights[ProviderClaude].Models) != 3 {
-		t.Fatalf("weights view = %+v", view.Weights)
+	// The quota API shows the suggestion with its historical estimate.
+	quota := manager.Quotas()[0]
+	if !quota.ModelWeights.Enabled || quota.ModelWeights.Basis != BasisWeighted || len(quota.ModelWeights.Suggestions) != 1 ||
+		quota.ModelWeights.Suggestions[0].Estimated == nil || quota.Estimate.Basis != BasisWeighted {
+		t.Fatalf("model weights = %+v", quota.ModelWeights)
 	}
 
 	// A manual multiplier takes precedence.
 	manual := 2.0
 	editWeights(&settings, ProviderClaude, func(w *WeightSettings) { w.Items[0].Manual = &manual })
-	if _, err := manager.SetSettings(settings); err != nil {
-		t.Fatal(err)
-	}
+	configure(t, manager, settings, AccountSettings{}, "a1")
 	if weight := manager.snap.Load().weights[ProviderClaude].effective[0]; weight.Source != WeightSourceManual || weight.Multiplier != 2 {
 		t.Fatalf("effective = %+v", weight)
 	}
@@ -162,11 +136,8 @@ func TestCalibrationLifecycle(t *testing.T) {
 		return []float64{0.3}
 	})
 	settings := DefaultSettings()
-	settings.Pools = []Pool{{ID: "p", AuthIndexes: []string{"a1"}}}
 	editWeights(&settings, ProviderClaude, func(w *WeightSettings) { w.Items = []WeightItem{{ID: "fable", Models: []string{"claude-fable"}}} })
-	if _, err := manager.SetSettings(settings); err != nil {
-		t.Fatal(err)
-	}
+	configure(t, manager, settings, AccountSettings{}, "a1")
 	if _, err := manager.StartCalibration("missing", "a1"); !IsInvalid(err) {
 		t.Fatalf("err = %v", err)
 	}
@@ -204,7 +175,7 @@ func TestCalibrationLifecycle(t *testing.T) {
 		t.Fatalf("effective = %+v", weight)
 	}
 	var stored string
-	if err := host.db.QueryRow(`SELECT result_json FROM cc_calibrations WHERE id = ?`, calibration.ID).Scan(&stored); err != nil || stored == "" {
+	if err := host.db.QueryRow(`SELECT result FROM calibrations WHERE instance = $1 AND id = $2`, testInstance, calibration.ID).Scan(&stored); err != nil || stored == "" {
 		t.Fatalf("stored result = %q, %v", stored, err)
 	}
 	if err := manager.StopCalibration(calibration.ID); !IsCalibrationNotFound(err) {
@@ -221,94 +192,21 @@ func TestCalibrationLifecycle(t *testing.T) {
 	}
 }
 
-func TestSchemaMigrationIsRepeatable(t *testing.T) {
-	host := newFakeHost(t)
-	for range 2 {
-		if err := EnsureSchema(host.db); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Each migration step can run again on tables it already created.
-	for _, migration := range ccMigrations {
-		if _, err := host.db.Exec(migration); err != nil {
-			t.Fatal(err)
-		}
-	}
-	var version string
-	if err := host.db.QueryRow(`SELECT value FROM cc_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "4" {
-		t.Fatalf("version = %q, %v", version, err)
-	}
-}
-
-// A version 2 database keeps its segments, which have no model split until a
-// rebuild recreates them from the retained request history.
-func TestUpgradeKeepsSegmentsAndRebuildAddsTheirSplit(t *testing.T) {
-	manager, host := weightedHost(t)
-	settings := DefaultSettings()
-	settings.Pools = []Pool{{ID: "p", AuthIndexes: []string{"a1"}}}
-	if _, err := manager.SetSettings(settings); err != nil {
-		t.Fatal(err)
-	}
-	before := storedSegments(t, host, "a1")
-	// Turn the database back into version 2: no split, no version 3 tables.
-	if _, err := host.db.Exec(`DROP TABLE cc_segment_costs; DROP TABLE cc_calibrations; UPDATE cc_meta SET value = '2' WHERE key = 'schema_version'`); err != nil {
-		t.Fatal(err)
-	}
-	upgraded := NewManager(host)
-	upgraded.RefreshInterval, upgraded.ProcessBudget = 0, time.Minute
-	view, err := upgraded.View()
-	if err != nil {
-		t.Fatal(err)
-	}
-	after := storedSegments(t, host, "a1")
-	if len(after) != len(before) || view.Weights[ProviderClaude].UnsplitSegments == 0 || view.Weights[ProviderClaude].Segments != len(before) {
-		t.Fatalf("segments %d → %d, unsplit %d", len(before), len(after), view.Weights[ProviderClaude].UnsplitSegments)
-	}
-	for i := range after {
-		if after[i].Split() && after[i].CostUSD > 0 || after[i].CostUSD != before[i].CostUSD || after[i].Gain != before[i].Gain {
-			t.Fatalf("segment %d = %+v, was %+v", i, after[i], before[i])
-		}
-	}
-	// The estimate does not depend on the split.
-	if !reflect.DeepEqual(upgraded.snap.Load().accounts["a1"].estimate, EstimateSegments(before, settings.Params, upgraded.snap.Load().at)) {
-		t.Fatal("the upgraded estimate changed")
-	}
-	if err := upgraded.Rebuild(); err != nil {
-		t.Fatal(err)
-	}
-	rebuilt := storedSegments(t, host, "a1")
-	if len(rebuilt) != len(before) {
-		t.Fatalf("rebuilt %d segments of %d", len(rebuilt), len(before))
-	}
-	for i := range rebuilt {
-		if !rebuilt[i].Split() || rebuilt[i].CostUSD != before[i].CostUSD {
-			t.Fatalf("rebuilt segment %d = %+v", i, rebuilt[i])
-		}
-	}
-}
-
 func TestPruneRemovesSegmentSplits(t *testing.T) {
 	host := newFakeHost(t)
-	if err := EnsureSchema(host.db); err != nil {
-		t.Fatal(err)
-	}
+	ctx := context.Background()
 	old, recent := host.now.Add(-48*time.Hour), host.now.Add(-time.Hour)
-	if err := commitAdvance(host.db, "a1", StreamState{}, []Segment{
+	if err := commitAdvance(ctx, host.db, testInstance, "a1", StreamState{}, []Segment{
 		{At: old, Block: old, CostUSD: 1, Gain: 1, Models: map[string]float64{"x": 1}},
 		{At: recent, Block: recent, CostUSD: 2, Gain: 1, Models: map[string]float64{"x": 1.5, "y": 0.5}},
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := pruneSegments(host.db, host.now.Add(-24*time.Hour)); err != nil {
+	if err := pruneSegments(ctx, host.db, testInstance, host.now.Add(-24*time.Hour)); err != nil {
 		t.Fatal(err)
-	}
-	var costs int
-	if err := host.db.QueryRow(`SELECT count(*) FROM cc_segment_costs`).Scan(&costs); err != nil || costs != 2 {
-		t.Fatalf("split rows = %d, %v", costs, err)
 	}
 	segments := storedSegments(t, host, "a1")
 	if len(segments) != 1 || !reflect.DeepEqual(segments[0].Models, map[string]float64{"x": 1.5, "y": 0.5}) {
 		t.Fatalf("segments = %+v", segments)
 	}
-	_ = sql.ErrNoRows
 }

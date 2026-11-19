@@ -1,17 +1,17 @@
 package ccbilling
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-
-	"cpa-super-billing/internal/messages"
 )
 
 // Estimate bases.
@@ -80,8 +80,8 @@ type weightCache struct {
 // refreshWeights needs refreshMu and runs within withDB after the accounts
 // advanced. Each provider's accounts have their own multipliers: it estimates
 // them, settles calibrations and resolves the effective multipliers.
-func (m *Manager) refreshWeights(db *sql.DB, now time.Time) (map[string]weightsSnapshot, error) {
-	calibrations, err := loadCalibrations(db)
+func (m *Manager) refreshWeights(ctx context.Context, db *sql.DB, now time.Time) (map[string]weightsSnapshot, error) {
+	calibrations, err := loadCalibrations(ctx, db, m.Instance)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func (m *Manager) refreshWeights(db *sql.DB, now time.Time) (map[string]weightsS
 				own = append(own, calibration)
 			}
 		}
-		weights, err := m.refreshProviderWeights(db, provider, own, now)
+		weights, err := m.refreshProviderWeights(ctx, db, provider, own, now)
 		if err != nil {
 			return nil, err
 		}
@@ -102,7 +102,7 @@ func (m *Manager) refreshWeights(db *sql.DB, now time.Time) (map[string]weightsS
 	return result, nil
 }
 
-func (m *Manager) refreshProviderWeights(db *sql.DB, provider string, calibrations []Calibration, now time.Time) (weightsSnapshot, error) {
+func (m *Manager) refreshProviderWeights(ctx context.Context, db *sql.DB, provider string, calibrations []Calibration, now time.Time) (weightsSnapshot, error) {
 	settings := m.settings.provider(provider).Weights
 	params := m.settings.ParamsFor(provider)
 	result := weightsSnapshot{basis: BasisRaw}
@@ -147,7 +147,7 @@ func (m *Manager) refreshProviderWeights(db *sql.DB, provider string, calibratio
 		}
 		if !cache.stream.Cursor.Before(calibration.EndedAt) {
 			// Every segment of the period is processed: the result is final.
-			if err := finishCalibration(db, calibration.ID, calibration.Result); err != nil {
+			if err := finishCalibration(ctx, db, m.Instance, calibration.ID, calibration.Result); err != nil {
 				return result, err
 			}
 			calibration.Final = true
@@ -302,7 +302,7 @@ type BasisComparison struct {
 	Weighted  BasisValues `json:"weighted"`
 }
 
-// WeightsView is the quota weights on the CC page.
+// WeightsView is the quota weights of one provider.
 type WeightsView struct {
 	Basis        string            `json:"basis"`
 	Estimate     WeightEstimate    `json:"estimate"`
@@ -425,7 +425,7 @@ func (m *Manager) Estimates() (Estimates, bool) {
 		return Estimates{}, false
 	}
 	now := m.host.Now()
-	latest, _ := m.live(snap)
+	latest := m.live()
 	result := Estimates{At: snap.at, Providers: map[string]ProviderWeights{}, Accounts: map[string]AccountEstimate{}}
 	for _, provider := range Providers {
 		weights := snap.weights[provider]
@@ -455,15 +455,15 @@ func (m *Manager) StartCalibration(itemID, authIndex string) (Calibration, error
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
 	var calibration Calibration
-	err := m.withDB(func(db *sql.DB) error {
-		if !slices.Contains(m.settings.authIndexes(), authIndex) {
-			return invalidf("Account %q is not configured in the subscription split", authIndex)
+	err := m.withDB(m.DBTimeout, func(ctx context.Context, db *sql.DB) error {
+		if _, ok := m.settings.Accounts[authIndex]; !ok {
+			return invalidf("Account %q is not tracked by this instance", authIndex)
 		}
 		item, ok := m.settings.provider(m.settings.AccountProvider(authIndex)).Weights.item(itemID)
 		if !ok {
 			return invalidf("Model test item %q does not exist", itemID)
 		}
-		existing, err := loadCalibrations(db)
+		existing, err := loadCalibrations(ctx, db, m.Instance)
 		if err != nil {
 			return err
 		}
@@ -473,7 +473,7 @@ func (m *Manager) StartCalibration(itemID, authIndex string) (Calibration, error
 			}
 		}
 		now := m.host.Now()
-		id, err := insertCalibration(db, item, authIndex, now)
+		id, err := insertCalibration(ctx, db, m.Instance, item, authIndex, now)
 		if err != nil {
 			return err
 		}
@@ -495,7 +495,9 @@ var ErrCalibrationNotFound = errCalibrationNotFound
 func (m *Manager) StopCalibration(id int64) error {
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
-	if err := m.withDB(func(db *sql.DB) error { return endCalibration(db, id, m.host.Now()) }); err != nil {
+	if err := m.withDB(m.DBTimeout, func(ctx context.Context, db *sql.DB) error {
+		return endCalibration(ctx, db, m.Instance, id, m.host.Now())
+	}); err != nil {
 		return err
 	}
 	return m.refreshLocked()
@@ -505,7 +507,7 @@ func (m *Manager) StopCalibration(id int64) error {
 func (m *Manager) DeleteCalibration(id int64) error {
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
-	if err := m.withDB(func(db *sql.DB) error { return deleteCalibration(db, id) }); err != nil {
+	if err := m.withDB(m.DBTimeout, func(ctx context.Context, db *sql.DB) error { return deleteCalibration(ctx, db, m.Instance, id) }); err != nil {
 		return err
 	}
 	return m.refreshLocked()
@@ -517,11 +519,10 @@ func IsCalibrationNotFound(err error) bool { return errors.Is(err, errCalibratio
 // invalidError marks a request the operator can correct, keeping its message.
 type invalidError struct{ error }
 
-func (e invalidError) MessageDetail() messages.Message { return messages.FromError(e.error) }
-func (e invalidError) Unwrap() error                   { return e.error }
+func (e invalidError) Unwrap() error { return e.error }
 
 func invalidf(format string, args ...any) error {
-	return invalidError{messages.Errorf(format, args...)}
+	return invalidError{fmt.Errorf(format, args...)}
 }
 
 // IsInvalid reports whether err rejects the request itself.

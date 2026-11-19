@@ -1,6 +1,7 @@
 package ccbilling
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -210,39 +211,41 @@ func calibrate(segments []Segment, item WeightItem, tested map[string]bool, star
 	return result
 }
 
-func insertCalibration(db *sql.DB, item WeightItem, authIndex string, at time.Time) (int64, error) {
+func insertCalibration(ctx context.Context, db *sql.DB, instance string, item WeightItem, authIndex string, at time.Time) (int64, error) {
 	raw, err := json.Marshal(item)
 	if err != nil {
 		return 0, err
 	}
-	result, err := db.Exec(`INSERT INTO cc_calibrations (item_json, auth_index, started_at) VALUES (?, ?, ?)`, string(raw), authIndex, nanos(at))
-	if err != nil {
-		return 0, fmt.Errorf("Save CC calibration: %w", err)
+	var id int64
+	if err := db.QueryRowContext(ctx, `INSERT INTO calibrations (instance, item, auth_index, started_ns) VALUES ($1, $2, $3, $4) RETURNING id`,
+		instance, string(raw), authIndex, nanos(at)).Scan(&id); err != nil {
+		return 0, fmt.Errorf("Save calibration: %w", err)
 	}
-	return result.LastInsertId()
+	return id, nil
 }
 
-func loadCalibrations(db *sql.DB) ([]Calibration, error) {
-	rows, err := db.Query(`SELECT id, item_json, auth_index, started_at, ended_at, result_json FROM cc_calibrations ORDER BY started_at DESC, id DESC`)
+func loadCalibrations(ctx context.Context, db *sql.DB, instance string) ([]Calibration, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, item, auth_index, started_ns, ended_ns, result FROM calibrations
+		WHERE instance = $1 ORDER BY started_ns DESC, id DESC`, instance)
 	if err != nil {
-		return nil, fmt.Errorf("Read CC calibrations: %w", err)
+		return nil, fmt.Errorf("Read calibrations: %w", err)
 	}
 	defer rows.Close()
 	calibrations := []Calibration{}
 	for rows.Next() {
 		var calibration Calibration
-		var item, result string
+		var item, result []byte
 		var started, ended int64
 		if err := rows.Scan(&calibration.ID, &item, &calibration.AuthIndex, &started, &ended, &result); err != nil {
-			return nil, fmt.Errorf("Read CC calibrations: %w", err)
+			return nil, fmt.Errorf("Read calibrations: %w", err)
 		}
-		if err := json.Unmarshal([]byte(item), &calibration.Item); err != nil {
-			return nil, fmt.Errorf("Read CC calibrations: %w", err)
+		if err := json.Unmarshal(item, &calibration.Item); err != nil {
+			return nil, fmt.Errorf("Read calibrations: %w", err)
 		}
 		calibration.StartedAt, calibration.EndedAt = timeAt(started), timeAt(ended)
-		if result != "" {
-			if err := json.Unmarshal([]byte(result), &calibration.Result); err != nil {
-				return nil, fmt.Errorf("Read CC calibrations: %w", err)
+		if len(result) > 0 {
+			if err := json.Unmarshal(result, &calibration.Result); err != nil {
+				return nil, fmt.Errorf("Read calibrations: %w", err)
 			}
 			calibration.Final = true
 		}
@@ -251,23 +254,24 @@ func loadCalibrations(db *sql.DB) ([]Calibration, error) {
 	return calibrations, rows.Err()
 }
 
-func finishCalibration(db *sql.DB, id int64, result CalibrationResult) error {
+func finishCalibration(ctx context.Context, db *sql.DB, instance string, id int64, result CalibrationResult) error {
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return err
 	}
-	if _, err := db.Exec(`UPDATE cc_calibrations SET result_json = ? WHERE id = ? AND ended_at <> 0`, string(raw), id); err != nil {
-		return fmt.Errorf("Save CC calibration: %w", err)
+	if _, err := db.ExecContext(ctx, `UPDATE calibrations SET result = $1 WHERE instance = $2 AND id = $3 AND ended_ns <> 0`,
+		string(raw), instance, id); err != nil {
+		return fmt.Errorf("Save calibration: %w", err)
 	}
 	return nil
 }
 
 var errCalibrationNotFound = errors.New("calibration not found")
 
-func endCalibration(db *sql.DB, id int64, at time.Time) error {
-	result, err := db.Exec(`UPDATE cc_calibrations SET ended_at = ? WHERE id = ? AND ended_at = 0`, nanos(at), id)
+func endCalibration(ctx context.Context, db *sql.DB, instance string, id int64, at time.Time) error {
+	result, err := db.ExecContext(ctx, `UPDATE calibrations SET ended_ns = $1 WHERE instance = $2 AND id = $3 AND ended_ns = 0`, nanos(at), instance, id)
 	if err != nil {
-		return fmt.Errorf("Save CC calibration: %w", err)
+		return fmt.Errorf("Save calibration: %w", err)
 	}
 	if count, _ := result.RowsAffected(); count == 0 {
 		return errCalibrationNotFound
@@ -275,10 +279,10 @@ func endCalibration(db *sql.DB, id int64, at time.Time) error {
 	return nil
 }
 
-func deleteCalibration(db *sql.DB, id int64) error {
-	result, err := db.Exec(`DELETE FROM cc_calibrations WHERE id = ?`, id)
+func deleteCalibration(ctx context.Context, db *sql.DB, instance string, id int64) error {
+	result, err := db.ExecContext(ctx, `DELETE FROM calibrations WHERE instance = $1 AND id = $2`, instance, id)
 	if err != nil {
-		return fmt.Errorf("Delete CC calibration: %w", err)
+		return fmt.Errorf("Delete calibration: %w", err)
 	}
 	if count, _ := result.RowsAffected(); count == 0 {
 		return errCalibrationNotFound

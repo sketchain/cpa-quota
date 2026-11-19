@@ -1,18 +1,18 @@
 package ccbilling
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"math"
 	"slices"
-	"strings"
 	"time"
 )
 
-// This file holds what the forecast, the simulation and the key usage charts
-// share: the conversion of recorded key cost to the estimate's basis and the
-// reads of key spend and utilization history. Every read is read only.
+// This file holds what the forecast reads: the conversion of recorded cost to
+// the estimate's basis and the reads of spend and utilization history. Every
+// read is read only.
 
 // priceMatchTolerance is how close, relatively, a price table multiplier must
 // be to a model's quota multiplier to count as already carrying it.
@@ -72,81 +72,35 @@ func (c BasisConversion) Convert(model string, usd float64) float64 {
 	return usd
 }
 
-// SpendRow is the recorded cost of one key's requests on one account and
-// model, within one hour or another range.
+// SpendRow is the recorded cost of an account's requests on one model.
 type SpendRow struct {
-	Scope     string
-	AuthIndex string
-	Hour      time.Time
-	Model     string
-	USD       float64
+	Model string
+	USD   float64
 }
 
-func placeholders(count int) string { return strings.TrimSuffix(strings.Repeat("?,", count), ",") }
-
-// readSpend sums the cost of the keys' requests made in [from, to), by key,
-// account, model and, when hourly, UTC hour. Requests count when they start.
-func readSpend(db *sql.DB, scopes []string, from, to time.Time, hourly bool, toUSD func(float64, string) float64) ([]SpendRow, error) {
-	if len(scopes) == 0 || !from.Before(to) {
+// readAccountSpend sums the cost of an account's requests made in [from, to),
+// by model. Requests count when they start.
+func readAccountSpend(ctx context.Context, db *sql.DB, instance, authIndex string, from, to time.Time) ([]SpendRow, error) {
+	if !from.Before(to) {
 		return nil, nil
 	}
-	hour := "0"
-	if hourly {
-		hour = fmt.Sprintf("at / %d", int64(time.Hour))
-	}
-	args := []any{nanos(from), nanos(to)}
-	for _, scope := range scopes {
-		args = append(args, scope)
-	}
-	rows, err := db.Query(`SELECT scope, auth_index, `+hour+` AS hour,
-		CASE WHEN billing_model <> '' THEN billing_model ELSE upstream_model END AS model, currency, sum(total_cost)
-		FROM request_events WHERE at >= ? AND at < ? AND scope IN (`+placeholders(len(scopes))+`)
-		GROUP BY scope, auth_index, hour, model, currency`, args...)
+	rows, err := db.QueryContext(ctx, `SELECT model, sum(cost_usd) FROM requests
+		WHERE instance = $1 AND auth_index = $2 AND requested_ns >= $3 AND requested_ns < $4 GROUP BY model`,
+		instance, authIndex, nanos(from), nanos(to))
 	if err != nil {
-		return nil, fmt.Errorf("Read key usage: %w", err)
+		return nil, fmt.Errorf("Read account usage: %w", err)
 	}
 	defer rows.Close()
 	var result []SpendRow
 	for rows.Next() {
 		var row SpendRow
-		var bucket int64
-		var currency string
-		var cost float64
-		if err := rows.Scan(&row.Scope, &row.AuthIndex, &bucket, &row.Model, &currency, &cost); err != nil {
-			return nil, fmt.Errorf("Read key usage: %w", err)
-		}
-		if hourly {
-			row.Hour = time.Unix(0, bucket*int64(time.Hour)).UTC()
+		if err := rows.Scan(&row.Model, &row.USD); err != nil {
+			return nil, fmt.Errorf("Read account usage: %w", err)
 		}
 		row.Model = NormalizeModel(row.Model)
-		row.USD = toUSD(cost, currency)
 		result = append(result, row)
 	}
 	return result, rows.Err()
-}
-
-// readSpendChunked reads hourly spend a week at a time, each in its own
-// database call, so a long history never holds the database for long.
-func (m *Manager) readSpendChunked(scopes []string, from, to time.Time) ([]SpendRow, error) {
-	var result []SpendRow
-	for start := from; start.Before(to); start = start.Add(Week) {
-		end := start.Add(Week)
-		if end.After(to) {
-			end = to
-		}
-		err := m.host.WithDB(func(db *sql.DB) error {
-			if db == nil {
-				return fmt.Errorf("The billing database is not open")
-			}
-			rows, err := readSpend(db, scopes, start, end, true, m.host.ToUSD)
-			result = append(result, rows...)
-			return err
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
 }
 
 // WindowPoint is one utilization report of a window.
@@ -158,10 +112,11 @@ type WindowPoint struct {
 
 // readWindowPoints reads an account's reports of one main window made in
 // (from, to], oldest first.
-func readWindowPoints(db *sql.DB, source QuotaSource, authIndex string, length time.Duration, from, to time.Time) ([]WindowPoint, error) {
-	rows, err := db.Query(`SELECT at, used_percent, reset_at FROM quota_report_windows
-		WHERE auth_index = ? AND provider = ? AND limit_key = ? AND seconds = ? AND at > ? AND at <= ? ORDER BY at, request_event_id`,
-		authIndex, source.Provider, source.LimitKey, int64(length/time.Second), nanos(from), nanos(to))
+func readWindowPoints(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string, length time.Duration, from, to time.Time) ([]WindowPoint, error) {
+	rows, err := db.QueryContext(ctx, `SELECT at_ns, used_percent, reset_ns FROM quota_report_windows
+		WHERE instance = $1 AND auth_index = $2 AND provider = $3 AND limit_key = $4 AND seconds = $5 AND at_ns > $6 AND at_ns <= $7
+		ORDER BY at_ns, report_id`,
+		instance, authIndex, source.Provider, source.LimitKey, int64(length/time.Second), nanos(from), nanos(to))
 	if err != nil {
 		return nil, fmt.Errorf("Read quota reports: %w", err)
 	}
@@ -179,12 +134,22 @@ func readWindowPoints(db *sql.DB, source QuotaSource, authIndex string, length t
 }
 
 // lastWindowPoint is an account's latest report of a window made at or before at.
-func lastWindowPoint(db *sql.DB, source QuotaSource, authIndex string, length time.Duration, at time.Time) (WindowPoint, bool, error) {
+func lastWindowPoint(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string, length time.Duration, at time.Time) (WindowPoint, bool, error) {
+	return windowPoint(ctx, db, `at_ns <= $6`, instance, source, authIndex, length, at)
+}
+
+// latestWindowPoint is an account's latest report of a window made at or after since.
+func latestWindowPoint(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string, length time.Duration, since time.Time) (WindowPoint, bool, error) {
+	return windowPoint(ctx, db, `at_ns >= $6`, instance, source, authIndex, length, since)
+}
+
+func windowPoint(ctx context.Context, db *sql.DB, condition, instance string, source QuotaSource, authIndex string, length time.Duration, at time.Time) (WindowPoint, bool, error) {
 	var point WindowPoint
 	var when, reset int64
-	err := db.QueryRow(`SELECT at, used_percent, reset_at FROM quota_report_windows
-		WHERE auth_index = ? AND provider = ? AND limit_key = ? AND seconds = ? AND at <= ? ORDER BY at DESC, request_event_id DESC LIMIT 1`,
-		authIndex, source.Provider, source.LimitKey, int64(length/time.Second), nanos(at)).Scan(&when, &point.Used, &reset)
+	err := db.QueryRowContext(ctx, `SELECT at_ns, used_percent, reset_ns FROM quota_report_windows
+		WHERE instance = $1 AND auth_index = $2 AND provider = $3 AND limit_key = $4 AND seconds = $5 AND `+condition+`
+		ORDER BY at_ns DESC, report_id DESC LIMIT 1`,
+		instance, authIndex, source.Provider, source.LimitKey, int64(length/time.Second), nanos(at)).Scan(&when, &point.Used, &reset)
 	switch {
 	case err == sql.ErrNoRows:
 		return WindowPoint{}, false, nil
@@ -195,53 +160,11 @@ func lastWindowPoint(db *sql.DB, source QuotaSource, authIndex string, length ti
 	return point, true, nil
 }
 
-// readHourlyPoints reads an account's last report of a window in each UTC
-// hour of [from, to), oldest first. SQLite takes the bare columns from the
-// row holding max(at).
-func readHourlyPoints(db *sql.DB, source QuotaSource, authIndex string, length time.Duration, from, to time.Time) ([]WindowPoint, error) {
-	rows, err := db.Query(fmt.Sprintf(`SELECT at / %d AS hour, max(at), used_percent, reset_at FROM quota_report_windows
-		WHERE auth_index = ? AND provider = ? AND limit_key = ? AND seconds = ? AND at >= ? AND at < ? GROUP BY hour ORDER BY hour`, int64(time.Hour)),
-		authIndex, source.Provider, source.LimitKey, int64(length/time.Second), nanos(from), nanos(to))
-	if err != nil {
-		return nil, fmt.Errorf("Read quota reports: %w", err)
-	}
-	defer rows.Close()
-	var points []WindowPoint
-	for rows.Next() {
-		var hour, at, reset int64
-		var used float64
-		if err := rows.Scan(&hour, &at, &used, &reset); err != nil {
-			return nil, fmt.Errorf("Read quota reports: %w", err)
-		}
-		points = append(points, WindowPoint{At: timeAt(at), Used: used, Reset: timeAt(reset)})
-	}
-	return points, rows.Err()
-}
-
 // ResetSeen is a scheduled 7-day reset of an account and when a report first
 // named it.
 type ResetSeen struct {
 	Reset     time.Time
 	FirstSeen time.Time
-}
-
-func readWeeklyResets(db *sql.DB, source QuotaSource, authIndex string, from time.Time) ([]ResetSeen, error) {
-	rows, err := db.Query(`SELECT reset_at, min(at) FROM quota_report_windows
-		WHERE auth_index = ? AND provider = ? AND limit_key = ? AND seconds = ? AND at >= ? AND reset_at > 0 GROUP BY reset_at ORDER BY reset_at`,
-		authIndex, source.Provider, source.LimitKey, int64(Week/time.Second), nanos(from))
-	if err != nil {
-		return nil, fmt.Errorf("Read quota reports: %w", err)
-	}
-	defer rows.Close()
-	var result []ResetSeen
-	for rows.Next() {
-		var reset, first int64
-		if err := rows.Scan(&reset, &first); err != nil {
-			return nil, fmt.Errorf("Read quota reports: %w", err)
-		}
-		result = append(result, ResetSeen{Reset: timeAt(reset), FirstSeen: timeAt(first)})
-	}
-	return result, rows.Err()
 }
 
 // Cycle is one 7-day period of a pool's anchor account.
@@ -333,7 +256,7 @@ func WeeklyCycles(resets []ResetSeen, current, from, now time.Time) []Cycle {
 
 // errNotLoaded reports a read that needs an estimate snapshot before the
 // first one exists.
-var errNotLoaded = errors.New("Split estimates are still loading; retry shortly")
+var errNotLoaded = errors.New("Quota estimates are still loading; retry shortly")
 
 // IsNotLoaded reports whether err means no estimate snapshot exists yet.
 func IsNotLoaded(err error) bool { return errors.Is(err, errNotLoaded) }

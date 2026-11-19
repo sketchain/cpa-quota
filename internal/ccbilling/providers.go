@@ -5,11 +5,9 @@ import (
 	"maps"
 	"slices"
 	"strings"
-
-	"cpa-super-billing/internal/messages"
 )
 
-// Subscription providers the split supports, by the provider name CLIProxyAPI
+// Subscription providers the estimates support, by the provider name CLIProxyAPI
 // gives their OAuth credentials.
 const (
 	ProviderClaude = "claude"
@@ -170,13 +168,13 @@ func normalizedProvider(provider string, input ProviderProfile, global Params) (
 	for _, tier := range input.Tiers {
 		index := slices.IndexFunc(profile.Tiers, func(known Tier) bool { return known.ID == tier.ID })
 		if index < 0 {
-			return ProviderProfile{}, messages.Errorf("Unknown tier %q for provider %s", tier.ID, provider)
+			return ProviderProfile{}, fmt.Errorf("Unknown tier %q for provider %s", tier.ID, provider)
 		}
 		if !finite(tier.WeeklyUSD) || tier.WeeklyUSD <= 0 || tier.WeeklyUSD > 1e9 {
-			return ProviderProfile{}, messages.Errorf("The weekly total of tier %s must be a positive amount", profile.Tiers[index].Name)
+			return ProviderProfile{}, fmt.Errorf("The weekly total of tier %s must be a positive amount", profile.Tiers[index].Name)
 		}
 		if tier.K != nil && (!finite(*tier.K) || *tier.K < 1 || *tier.K > 100) {
-			return ProviderProfile{}, messages.Errorf("The default k of tier %s must be from 1 to 100", profile.Tiers[index].Name)
+			return ProviderProfile{}, fmt.Errorf("The default k of tier %s must be from 1 to 100", profile.Tiers[index].Name)
 		}
 		profile.Tiers[index].WeeklyUSD = tier.WeeklyUSD
 		profile.Tiers[index].K = nil
@@ -194,21 +192,6 @@ func normalizedProvider(provider string, input ProviderProfile, global Params) (
 	}
 	profile.Weights = weights
 	return profile, nil
-}
-
-// legacyTiers applies the tier amounts and k of settings saved before
-// providers existed to Claude's profile.
-func legacyTiers(profile ProviderProfile, weekly, k map[string]float64) ProviderProfile {
-	profile.Tiers = slices.Clone(profile.Tiers)
-	for i, tier := range profile.Tiers {
-		if value, ok := weekly[tier.ID]; ok {
-			profile.Tiers[i].WeeklyUSD = value
-		}
-		if value, ok := k[tier.ID]; ok {
-			profile.Tiers[i].K = floatPointer(value)
-		}
-	}
-	return profile
 }
 
 // tierTables are a profile's tier amounts and k as the maps Params carries
@@ -244,15 +227,9 @@ func (s Settings) ParamsFor(provider string) Params {
 	return params
 }
 
-// AccountProvider is the provider of a configured account: its pool's, else
-// the one its settings name, else Claude, the only provider of settings saved
-// before providers existed.
+// AccountProvider is the provider of a configured account: the one its
+// settings name, else Claude.
 func (s Settings) AccountProvider(authIndex string) string {
-	for _, pool := range s.Pools {
-		if slices.Contains(pool.AuthIndexes, authIndex) {
-			return pool.Provider
-		}
-	}
 	if provider := s.Accounts[authIndex].Provider; provider != "" {
 		return provider
 	}

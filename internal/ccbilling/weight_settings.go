@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-
-	"cpa-super-billing/internal/messages"
 )
 
 // WeightItem is one model under test: models whose subscription quota use
@@ -110,7 +108,7 @@ func (w WeightSettings) normalized() (WeightSettings, error) {
 				return WeightSettings{}, fmt.Errorf("Model ID is too long")
 			}
 			if owner, taken := owners[model]; taken {
-				return WeightSettings{}, messages.Errorf("Model %q is already in test item %q; a model can belong to only one item", model, owner)
+				return WeightSettings{}, fmt.Errorf("Model %q is already in test item %q; a model can belong to only one item", model, owner)
 			}
 			owners[model] = item.Label()
 			models = append(models, model)

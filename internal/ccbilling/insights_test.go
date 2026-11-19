@@ -145,31 +145,3 @@ func TestWeeklyCyclesFollowObservedResetsAndStepBackWithoutThem(t *testing.T) {
 		t.Fatalf("gap cycles = %+v", cycles)
 	}
 }
-
-func TestSettleCyclesForfeitsWhatEndedCyclesLeft(t *testing.T) {
-	day := 24 * time.Hour
-	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	cycles := []Cycle{{Start: base, End: base.Add(7 * day)}, {Start: base.Add(7 * day), End: base.Add(14 * day)}, {Start: base.Add(14 * day), End: base.Add(21 * day)}}
-	hours := []SpendHour{
-		{At: base.Add(time.Hour), USD: 30}, {At: base.Add(2 * day), USD: 40},
-		// The first hour of the second cycle counts there.
-		{At: base.Add(7 * day), USD: 120},
-		{At: base.Add(15 * day), USD: 25},
-	}
-	got := SettleCycles(cycles, 100, hours, base.Add(time.Hour), base.Add(16*day))
-	if len(got) != 3 {
-		t.Fatalf("cycles = %+v", got)
-	}
-	// Partial: the history begins after the first cycle started.
-	if !got[0].Settled || !got[0].Partial || got[0].UsedUSD != 70 || got[0].ForfeitedUSD != 30 || got[0].RemainingUSD != 0 {
-		t.Fatalf("first = %+v", got[0])
-	}
-	// Overuse forfeits nothing.
-	if !got[1].Settled || got[1].Partial || got[1].UsedUSD != 120 || got[1].ForfeitedUSD != 0 {
-		t.Fatalf("second = %+v", got[1])
-	}
-	// The running cycle is not settled yet.
-	if got[2].Settled || got[2].UsedUSD != 25 || got[2].ForfeitedUSD != 0 || got[2].RemainingUSD != 75 {
-		t.Fatalf("running = %+v", got[2])
-	}
-}

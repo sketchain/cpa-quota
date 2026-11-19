@@ -11,34 +11,25 @@ import (
 func trendManager(t *testing.T) (*Manager, *fakeHost) {
 	t.Helper()
 	host := newFakeHost(t)
-	if err := EnsureSchema(host.db); err != nil {
-		t.Fatal(err)
-	}
 	block := host.now.Add(-30 * time.Hour)
 	for i := range 24 {
 		cost := 0.1
 		if i >= 10 && i < 14 {
 			cost = 0.01 // points without plugin cost: outside usage
 		}
-		if _, err := host.db.Exec(`INSERT INTO cc_segments (auth_index, block_at, at, cost_usd, gain) VALUES ('a1', ?, ?, ?, 1)`,
-			nanos(block), nanos(block.Add(time.Duration(i+1)*time.Minute)), cost); err != nil {
+		if _, err := host.db.Exec(`INSERT INTO segments (instance, auth_index, block_ns, at_ns, cost_usd, gain) VALUES ($1, 'a1', $2, $3, $4, 1)`,
+			testInstance, nanos(block), nanos(block.Add(time.Duration(i+1)*time.Minute)), cost); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := range 6 {
-		if _, err := host.db.Exec(`INSERT INTO cc_k_buckets (auth_index, bucket_at, gain_5h, gain_7d) VALUES ('a1', ?, ?, ?)`,
-			nanos(host.now.Add(-time.Duration(48-i)*time.Hour).Truncate(time.Hour)), 8.0, 1.0); err != nil {
+		if _, err := host.db.Exec(`INSERT INTO k_buckets (instance, auth_index, bucket_ns, gain_5h, gain_7d) VALUES ($1, 'a1', $2, $3, $4)`,
+			testInstance, nanos(host.now.Add(-time.Duration(48-i)*time.Hour).Truncate(time.Hour)), 8.0, 1.0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	manager := NewManager(host)
-	manager.RefreshInterval = 0
-	settings := DefaultSettings()
-	settings.Pools = []Pool{{ID: "p", AuthIndexes: []string{"a1"}}}
-	settings.Accounts["a2"] = AccountSettings{Tier: TierMax5x}
-	if _, err := manager.SetSettings(settings); err != nil {
-		t.Fatal(err)
-	}
+	manager := newTestManager(host)
+	configure(t, manager, DefaultSettings(), AccountSettings{}, "a1", "a2")
 	if manager.snap.Load() == nil {
 		t.Fatal("no snapshot")
 	}
@@ -51,10 +42,6 @@ func TestTrendMarksTheEstimatesExclusionsWithoutRefreshingOrWriting(t *testing.T
 	estimate := snap.accounts["a1"].estimate
 	if estimate.ExcludedSegments == 0 {
 		t.Fatalf("the fixture excludes nothing: %+v", estimate)
-	}
-	// Any write through the only connection now fails.
-	if _, err := host.db.Exec(`PRAGMA query_only = ON`); err != nil {
-		t.Fatal(err)
 	}
 	// New history a refresh would process.
 	host.now = host.now.Add(2 * time.Hour)
@@ -69,7 +56,7 @@ func TestTrendMarksTheEstimatesExclusionsWithoutRefreshingOrWriting(t *testing.T
 	if manager.snap.Load() != snap {
 		t.Fatal("Trend published a new snapshot")
 	}
-	// Now, WithDB and nothing else: no refresh reads observations or keys.
+	// Now, WithDB and nothing else: no refresh reads observations.
 	if calls := host.calls.Load() - latest; calls != 2 {
 		t.Fatalf("Trend made %d host calls, want Now and WithDB", calls)
 	}
@@ -105,15 +92,15 @@ func TestTrendAccountsAndUnloadedState(t *testing.T) {
 	if _, found, err := manager.Trend("unknown"); found || err != nil {
 		t.Fatalf("unconfigured account = %v, %v", found, err)
 	}
-	// Accounts with settings but no pool are configured too.
+	// Accounts without history are tracked too.
 	if trend, found, err := manager.Trend("a2"); !found || err != nil || len(trend.Segments) != 0 || trend.Buckets == nil {
 		t.Fatalf("a2 = %+v, %v, %v", trend, found, err)
 	}
-	// Before settings load, nothing is read.
+	// An account not tracked yet reads nothing.
 	host := newFakeHost(t)
-	fresh := NewManager(host)
-	if _, _, err := fresh.Trend("a1"); err == nil {
-		t.Fatal("Trend before the settings loaded succeeded")
+	fresh := newTestManager(host)
+	if _, found, err := fresh.Trend("a1"); found || err != nil {
+		t.Fatalf("Trend of an untracked account = %v, %v", found, err)
 	}
 	if host.calls.Load() != 0 {
 		t.Fatalf("Trend before loading made %d host calls", host.calls.Load())
@@ -162,5 +149,30 @@ func TestSegmentExclusionsMatchEstimate(t *testing.T) {
 		if count != estimate.ExcludedSegments || count == 0 {
 			t.Fatalf("%s: %d exclusions, estimate %d", mode, count, estimate.ExcludedSegments)
 		}
+	}
+}
+
+func TestDailyTrendSplitsDaysInTheLocation(t *testing.T) {
+	manager, host := trendManager(t)
+	days, ok := manager.TrendDays("a1")
+	if !ok || len(days) != 2 {
+		t.Fatalf("days = %+v, %v", days, ok)
+	}
+	// Six buckets of 8 / 1 points two days ago, and the 24 segments a day later.
+	if days[0].Gain5h != 48 || days[0].Gain7d != 6 || days[0].K == nil || *days[0].K != 8 || days[0].Segments != 0 {
+		t.Fatalf("first day = %+v", days[0])
+	}
+	if days[1].Segments+days[1].ExcludedSegments != 24 || days[1].ExcludedSegments == 0 || days[1].K != nil {
+		t.Fatalf("second day = %+v", days[1])
+	}
+	var stored int
+	if err := host.db.QueryRow(`SELECT count(*) FROM k_trend_daily WHERE instance = $1 AND auth_index = 'a1'`, testInstance).Scan(&stored); err != nil || stored != 2 {
+		t.Fatalf("stored days = %d, %v", stored, err)
+	}
+	// Days of another time zone start at its midnight.
+	location := time.FixedZone("UTC+14", 14*3600)
+	shifted := dailyTrend(manager.accounts["a1"].buckets, nil, nil, location)
+	if len(shifted) == 0 || shifted[0].Day == days[0].Day && shifted[0].Gain5h == days[0].Gain5h {
+		t.Fatalf("shifted days = %+v", shifted)
 	}
 }
