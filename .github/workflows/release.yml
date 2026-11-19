@@ -91,7 +91,7 @@ jobs:
           MARCH: ${{ matrix.march }}
         run: |
           mkdir -p dist
-          export "$CPU" CGO_CFLAGS="-O2 -march=$MARCH" CC=gcc
+          export "${CPU:?}" CGO_CFLAGS="-O2 -march=$MARCH" CC=gcc
           CGO_ENABLED=1 GOOS=windows GOARCH="$ARCH" go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" \
             -tags cshared -buildmode=c-shared -o dist/cpa-quota.dll ./cmd/cpa-quota
 
@@ -107,7 +107,11 @@ jobs:
           version="${TAG#v}"
           # CLIProxyAPI's plugin store installs <id>_<version>_<os>_<arch>.zip.
           archive="cpa-quota_${version}_${OS}_${ARCH}"
-          (cd dist && 7z a -tzip "../$archive.zip" "cpa-quota.$EXT" >/dev/null 2>&1 || zip -j "../$archive.zip" "cpa-quota.$EXT")
+          if command -v zip >/dev/null 2>&1; then
+            zip -j "$archive.zip" "dist/cpa-quota.$EXT"
+          else
+            (cd dist && 7z a -tzip "../$archive.zip" "cpa-quota.$EXT" >/dev/null)
+          fi
           if [ "$OS" != windows ]; then
             tar -czf "$archive.tar.gz" -C dist "cpa-quota.$EXT"
           fi
