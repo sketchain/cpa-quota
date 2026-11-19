@@ -213,3 +213,21 @@ func TestQuotaReportsPauses(t *testing.T) {
 		t.Fatalf("paused quota = %+v", quota)
 	}
 }
+
+func TestAccountsSeenDuringARefreshAreTrackedByTheNext(t *testing.T) {
+	host := newFakeHost(t)
+	manager := newTestManager(host)
+	configure(t, manager, DefaultSettings(), AccountSettings{})
+	// Track never waits for a running refresh.
+	manager.refreshMu.Lock()
+	if manager.Track("a7") {
+		t.Fatal("tracked while a refresh held the lock")
+	}
+	manager.refreshMu.Unlock()
+	if err := manager.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if quotas := manager.Quotas(); len(quotas) != 1 || quotas[0].AuthIndex != "a7" {
+		t.Fatalf("quotas = %+v", quotas)
+	}
+}

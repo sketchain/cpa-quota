@@ -74,13 +74,16 @@ type Manager struct {
 	Instance string
 
 	// refreshMu serializes refreshes and owns the fields below it.
-	refreshMu   sync.Mutex
-	settings    Settings
-	template    AccountSettings
-	allowed     []string
-	accounts    map[string]*accountCache
-	generation  uint64
-	attached    bool
+	refreshMu  sync.Mutex
+	settings   Settings
+	template   AccountSettings
+	allowed    []string
+	accounts   map[string]*accountCache
+	generation uint64
+	attached   bool
+	// discovered reports that the database's accounts were read since the
+	// caches were last loaded.
+	discovered  bool
 	lastRefresh time.Time
 	lastPrune   time.Time
 	// weightCache holds each provider's last weight estimate and the inputs
@@ -95,6 +98,10 @@ type Manager struct {
 
 	liveMu sync.RWMutex
 	latest map[string]Observation
+
+	// trackMu guards the accounts Track saw while a refresh ran.
+	trackMu      sync.Mutex
+	pendingTrack map[string]bool
 
 	lastError atomic.Value
 
@@ -165,6 +172,7 @@ func (m *Manager) Configure(settings Settings, template AccountSettings, allowed
 	m.loaded.Store(&normalized)
 	if changedProvider {
 		m.accounts = map[string]*accountCache{}
+		m.discovered = false
 	}
 	m.weightCache = nil
 	m.snap.Store(nil)
@@ -195,10 +203,28 @@ func (m *Manager) Track(authIndex string) bool {
 		return true
 	}
 	if !m.refreshMu.TryLock() {
+		// A refresh is running; the next one adds the account.
+		m.trackMu.Lock()
+		if m.pendingTrack == nil {
+			m.pendingTrack = map[string]bool{}
+		}
+		m.pendingTrack[authIndex] = true
+		m.trackMu.Unlock()
 		return false
 	}
 	defer m.refreshMu.Unlock()
 	return m.trackLocked(authIndex)
+}
+
+// trackPendingLocked needs refreshMu. It adds the accounts Track could not.
+func (m *Manager) trackPendingLocked() {
+	m.trackMu.Lock()
+	pending := m.pendingTrack
+	m.pendingTrack = nil
+	m.trackMu.Unlock()
+	for _, index := range sortedKeys(pending) {
+		m.trackLocked(index)
+	}
 }
 
 func (m *Manager) trackLocked(authIndex string) bool {
@@ -325,6 +351,7 @@ func (m *Manager) withDB(timeout time.Duration, fn func(ctx context.Context, db 
 			m.weightCache = nil
 			m.persisted = persistedState{}
 			m.lastPrune = time.Time{}
+			m.discovered = false
 		}
 		return fn(ctx, db)
 	})
@@ -337,14 +364,21 @@ func (m *Manager) refreshLocked() error {
 	accounts := map[string]accountSnapshot{}
 	var weights map[string]weightsSnapshot
 	latestStored := map[string]Observation{}
+	m.trackPendingLocked()
 	err := m.withDB(m.ProcessBudget+m.DBTimeout, func(ctx context.Context, db *sql.DB) error {
-		known, err := knownAccounts(ctx, db, m.Instance, m.trackedProvider())
-		if err != nil {
-			return err
+		if !m.discovered {
+			// The accounts the database has records of, once per load:
+			// usage handling tracks new ones as they appear.
+			known, err := knownAccounts(ctx, db, m.Instance, m.trackedProvider())
+			if err != nil {
+				return err
+			}
+			for _, index := range known {
+				m.trackLocked(index)
+			}
+			m.discovered = true
 		}
-		for _, index := range known {
-			m.trackLocked(index)
-		}
+		var err error
 		params := m.settings.Params
 		cutoff := now.Add(-params.retention())
 		if m.lastPrune.IsZero() || now.Sub(m.lastPrune) > time.Hour {
