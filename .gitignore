@@ -1,0 +1,9 @@
+dist/
+*.so
+*.dylib
+*.dll
+*.h
+.env
+.env.*
+!.env.example
+.claude
