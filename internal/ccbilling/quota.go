@@ -79,7 +79,10 @@ type EstimateSummary struct {
 	ColdStartBlocks  int     `json:"cold_start_blocks"`
 	Segments         int     `json:"segments"`
 	ExcludedSegments int     `json:"excluded_segments"`
-	Basis            string  `json:"basis"`
+	// VoidedSegments counts the segments voided because a request in them
+	// had a cost that could not be computed; they are not in Segments.
+	VoidedSegments int    `json:"voided_segments"`
+	Basis          string `json:"basis"`
 	// EstimatedAt is when the snapshot was computed; null before the first.
 	EstimatedAt *time.Time `json:"estimated_at"`
 }
@@ -219,7 +222,7 @@ func accountQuota(snap *snapshot, latest map[string]Observation, authIndex strin
 	weights := providerWeights(snap, status.Provider)
 	quota.Estimate = EstimateSummary{Ratio: status.Ratio, CleanBlocks: status.CleanBlocks, TotalBlocks: status.TotalBlocks,
 		ColdStartBlocks: params.ColdStartBlocks, Segments: status.Estimate.Segments, ExcludedSegments: status.ExcludedSegments,
-		Basis: weights.Basis, EstimatedAt: timePointer(snap.at)}
+		VoidedSegments: cached.excluded.Voided(), Basis: weights.Basis, EstimatedAt: timePointer(snap.at)}
 	if status.Ratio > 0 {
 		quota.Estimate.USDPerPoint = 1 / status.Ratio
 	}

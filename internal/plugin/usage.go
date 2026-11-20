@@ -74,8 +74,8 @@ func buildFacts(config Config, record UsageRecord, provider, authIndex string, a
 	cost := 0.0
 	if priced {
 		cost = pricing.Cost(rates, breakdown)
-		// ServiceTier is what the client asked for, as cpa-super-billing
-		// priced it.
+		// Fast mode bills the service tier the client asked for, which is
+		// known when the request is priced.
 		if config.CodexFastModeBilling && provider == ccbilling.ProviderCodex && breakdown.Billable() &&
 			strings.EqualFold(strings.TrimSpace(record.ServiceTier), "priority") {
 			cost *= pricing.FastModeMultiplier

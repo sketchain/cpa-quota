@@ -11,17 +11,17 @@ import (
 
 // claudeRegressionDigest runs a simulated Claude account with sporadic
 // outside usage through the manager and describes every estimate it
-// produces. The golden digest below is the account part of the one
-// cpa-super-billing's claude_regression_test.go pins, for the same
-// simulation, so the estimates stay value for value what they were.
+// produces. The golden digest below pins those estimates value for value,
+// so a change to the segments, the filter, k or the totals shows up here and
+// its new values are reviewed before the golden digest is updated.
 func claudeRegressionDigest(t *testing.T) string {
 	t.Helper()
 	sim := newSimulation(29, 40, 6)
 	sim.run(24, sporadicOutside)
 	host := newFakeHost(t)
 	host.now = sim.end(24).Add(-30 * time.Minute)
-	// The golden digest's host reported no stored utilization; the live
-	// reports below are the only ones.
+	// Only the live reports below give the current utilization, so the
+	// digest shows how each one changes the remaining amounts.
 	saved := readLatest
 	readLatest = func(context.Context, *sql.DB, string, Settings, time.Time) (map[string]Observation, error) {
 		return map[string]Observation{}, nil
@@ -54,9 +54,9 @@ func claudeRegressionDigest(t *testing.T) string {
 			if account.K != nil {
 				k = fmt.Sprintf("%.10g", *account.K)
 			}
-			fmt.Fprintf(&b, "account %s tier=%s ratio=%.10g t5=%.10g blocks=%d/%d segs=%d/%d k=%s/%s cold=%v from=%s T5=%.10g T7=%.10g u=%.4g/%.4g R=%.10g/%.10g\n",
+			fmt.Fprintf(&b, "account %s tier=%s ratio=%.10g t5=%.10g blocks=%d/%d segs=%d/%d/%d k=%s/%s cold=%v from=%s T5=%.10g T7=%.10g u=%.4g/%.4g R=%.10g/%.10g\n",
 				account.AuthIndex, account.Tier, account.Ratio, account.Estimate.FiveHourUSD, account.CleanBlocks, account.TotalBlocks,
-				account.Estimate.Segments, account.ExcludedSegments, k, account.KSource, account.ColdStart, account.TotalsFrom,
+				account.Estimate.Segments, account.ExcludedSegments, account.Excluded.Voided(), k, account.KSource, account.ColdStart, account.TotalsFrom,
 				account.FiveHourTotal, account.WeeklyTotal, account.Used5h, account.Used7d, account.RemainingFiveHour, account.RemainingWeek)
 		}
 	}
@@ -70,22 +70,22 @@ func claudeRegressionDigest(t *testing.T) string {
 	return b.String()
 }
 
-func TestClaudeResultsMatchCPASuperBilling(t *testing.T) {
+func TestClaudeRegression(t *testing.T) {
 	got := claudeRegressionDigest(t)
 	if got != claudeRegressionGolden {
 		t.Fatalf("Claude digest changed:\n--- got\n%s\n--- want\n%s", got, claudeRegressionGolden)
 	}
 }
 
-// claudeRegressionGolden keeps the segment count and account lines of
-// cpa-super-billing's golden digest (6178db1); its pool, fixed key and key
-// admission lines describe features this plugin does not have.
+// claudeRegressionGolden is the digest of the simulation above. Every
+// simulated request is priced with complete usage, so no segment is voided
+// (segs = kept/excluded by the filter/voided).
 const claudeRegressionGolden = `5h=20 segments=10959
-account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683 k=5.995554391/auto cold=false from=estimated T5=40.0482056 T7=240.1111949 u=20/40 R=28.83470803/129.6600453
+account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683/0 k=5.995554391/auto cold=false from=estimated T5=40.0482056 T7=240.1111949 u=20/40 R=28.83470803/129.6600453
 5h=60 segments=10959
-account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683 k=5.995554391/auto cold=false from=estimated T5=40.0482056 T7=240.1111949 u=60/40 R=14.41735401/129.6600453
+account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683/0 k=5.995554391/auto cold=false from=estimated T5=40.0482056 T7=240.1111949 u=60/40 R=14.41735401/129.6600453
 5h=97 segments=10959
-account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683 k=5.995554391/auto cold=false from=estimated T5=40.0482056 T7=240.1111949 u=97/40 R=1.081301551/129.6600453
+account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683/0 k=5.995554391/auto cold=false from=estimated T5=40.0482056 T7=240.1111949 u=97/40 R=1.081301551/129.6600453
 manual k segments=10959
-account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683 k=6.5/manual cold=false from=estimated T5=40.0482056 T7=260.3133364 u=97/40 R=1.081301551/140.5692016
+account a1 tier=max5x ratio=2.496990777 t5=40.0482056 blocks=97/98 segs=10959/683/0 k=6.5/manual cold=false from=estimated T5=40.0482056 T7=260.3133364 u=97/40 R=1.081301551/140.5692016
 `
