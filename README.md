@@ -70,7 +70,7 @@ plugins:
 | `tier_k` | Claude 各档 `8`；ChatGPT 无 | 没有手动和估算 k 时使用的档位默认 k，可按档位覆盖。 |
 | `auth_indexes` | 空 | 非空时只统计这些账号，并且启动即列出它们；为空时自动跟踪出现的同订阅账号。 |
 | `account_auth_types` | `[oauth]` | 计入的凭证类型（CPA 的 `AuthType`：`oauth`、`apikey`）。 |
-| `codex_fast_mode_billing` | `false` | 开启后 ChatGPT `priority` 请求按 2.5 倍计费（同旧插件）。 |
+| `codex_fast_mode_billing` | `false` | 开启后 ChatGPT `priority` 请求（按客户端请求的 service tier 判断）按 2.5 倍计费。 |
 | `db_timeout_seconds` | `3` | 连接与每次数据库操作的超时。 |
 | `db_retry_seconds` | `60` | 数据库不可用后的最短重连间隔。 |
 | `refresh_interval_seconds` | `60` | 估算刷新的最短间隔。 |
@@ -98,16 +98,17 @@ plugins:
 
 ## 估算方法
 
-估算核心原样沿用 cpa-super-billing 的 `internal/ccbilling`：
+估算核心在 `internal/ccbilling`：
 
 - 每次利用率跨过一个整数点切出一段（1% 段），记录这段期间完成的请求费用；百分比带小数时按跨整数点切段。
+- 主窗口内的请求只要费用没能算出来（模型未定价，或用量不完整、不可计费），它完成时所在的段就作废：不写入 `segments`，不参与总额估算和模型倍率估算 / 校准，大块照常延续（作废段的增量和费用一起剔除，不影响相邻段的滑动窗口）。作废段按原因计数（目前只有 `unpriced`），见下文「费用缺失的请求」。
 - 相邻数据点间隔超过 5 分钟断开大块；用 8% 宽的滑动窗口比较「点数 / 美元」，剔除可疑（被外部用量污染）的段。
 - 各大块的干净比值按干净增量的平方加权，近 14 天占 90%，得到 5 小时总额 T5 = 100 / 比值。
-- k（周 / 5 小时）由两窗口同期增量估算，周总额 T7 = k × T5；手动 k 优先，其次估算值，最后档位默认值。
+- k（周 / 5 小时）只由两窗口同期的利用率增量估算，不用段和费用，因此不受费用缺失影响；周总额 T7 = k × T5；手动 k 优先，其次估算值，最后档位默认值。
 - 干净大块少于 20 时冷启动，周总额取档位默认值。
 - 剩余额度 R = 0.9 × T × (1 − u)，u 为当前窗口利用率。
 - Claude 读 `anthropic-ratelimit-unified-5h/7d-*`；ChatGPT 读 `X-Codex-Primary/Secondary-*`，只把主额度（premium）的 5 小时 / 周窗口计入，额度用满或在扣 credits 时暂停切段；只有 7 天窗口的账号按 7 天窗口切段。
-- 模型倍率估算与校准、消耗预测、每日 k 趋势同旧插件。
+- 另外计算模型倍率（按各段的模型费用拆分估算，或按校准时段测量）、两个窗口的消耗预测（回看 `forecast_window_*`）和每日 k 趋势（按 `trend_timezone` 切天）。
 
 ## 价格
 
@@ -118,9 +119,18 @@ plugins:
 - 缓存读 = 输入 × `cache_ratio`
 - 缓存写 = 输入 × `create_cache_ratio`
 
-某个比率缺失时按 1 处理，即该部分按输入单价计费（与旧插件对缺失缓存价格「沿用输入单价」的处理一致）。表里没有的模型视为未定价，费用为 0；ChatGPT 的未定价请求不计入切段，Claude 同旧插件计入（费用为 0）。
+某个比率缺失时按 1 处理，即该部分按输入单价计费。表里没有的模型视为未定价，`requests.cost_usd` 记 0、`priced` 为 false。
 
-模型按「上游模型名 → 客户端别名」的顺序查找，忽略大小写、`(high)` 之类的请求选项、`/` 之前的命名空间和 `-high` / `-low` 后缀。token 按 CPA 对 Claude（输入、缓存读写分列，输出已含推理）和 Codex（缓存含在输入里，推理含在输出里）的口径拆分，推理不重复计费；计数自相矛盾或只有总数的用量记录但不计费。
+模型按「上游模型名 → 客户端别名」的顺序查找，忽略大小写、`(high)` 之类的请求选项、`/` 之前的命名空间和 `-high` / `-low` 后缀。token 按 CPA 对 Claude（输入、缓存读写分列，输出已含推理）和 Codex（缓存含在输入里，推理含在输出里）的口径拆分，推理不重复计费；计数自相矛盾或只有总数的用量（`accounting` 为 `inconsistent` / `unclassified`）记录但不计费，`cost_usd` 记 0。
+
+### 费用缺失的请求
+
+记 0 的费用不是真实费用，把它算进段会让段显得偏便宜、周总额被低估，所以对所有订阅一视同仁：
+
+- 主窗口内的请求，模型未定价且报告了用量，或者用量不完整（`inconsistent` / `unclassified`），它完成时所在的段作废，原因记为 `unpriced`。没有报告任何用量的请求（如失败请求）费用确实为 0，不导致作废。
+- 落在大块第一次跨点之前的请求本来就不属于任何段，不作废任何段。
+- ChatGPT 中属于另一个额度池的请求（响应没有主额度窗口，原因 `other_limit`，包括没有额度报告的请求）照旧只剔除自身费用，段不作废，即使它的模型未定价。
+- 诊断：`streams.state` 的 `excluded` 中，`requests` / `usd` 按原因统计被剔除的请求数与费用，`unpriced_models` 列出未定价模型及其请求数（最多 50 个，Claude 和 ChatGPT 都会列出），`voided_segments` 按原因统计作废段数；额度接口的 `estimate.voided_segments` 给出作废段总数。
 
 刷新：注册时拉一次；之后 `usage.handle` 发现距上次成功超过 24 小时就同步拉一次（失败沿用旧表并写日志，5 分钟内不重试）。最近一次成功的倍率表存进 PostgreSQL；启动时拉取失败就用库里的。
 
@@ -158,16 +168,14 @@ plugins:
 
 | 表 | 主键 | 内容 |
 | --- | --- | --- |
-| `streams` | `instance, auth_index` | 增量处理位置（JSON）：游标、窗口跟踪、当前大块、暂停状态、被规则排除的费用 |
-| `segments` | `id` | 1% 段：`block_ns`（所属大块起点）、`at_ns`、`cost_usd`、`gain`（利用率增量）、`models`（按模型拆分的费用 JSON） |
+| `streams` | `instance, auth_index` | 增量处理位置（JSON）：游标、窗口跟踪、当前大块（含待作废标记）、暂停状态、`excluded`（被剔除的请求与费用、未定价模型、作废段计数） |
+| `segments` | `id` | 计入估算的 1% 段（作废段不写入）：`block_ns`（所属大块起点）、`at_ns`、`cost_usd`、`gain`（利用率增量）、`models`（按模型拆分的费用 JSON） |
 | `k_buckets` | `instance, auth_index, bucket_ns` | 每小时的 k 证据：`gain_5h`、`gain_7d` |
 | `blocks` | `instance, auth_index, start_at` | 当前估算的大块统计：段数、剔除数、增量 / 费用、干净增量 / 费用、参考比值及模式、是否干净 |
 | `estimates` | `instance, auth_index` | **当前估算快照，下游面板直接读这张**：列与额度接口账号对象的主要字段一致，`detail` 为完整账号对象 JSON |
 | `k_trend_daily` | `instance, auth_index, day` | 每日 k 趋势：`gain_5h`、`gain_7d`、当日 `k`、保留段数、剔除段数、干净段费用与增量 |
 | `model_weights` | `instance, provider` | 模型倍率结果：是否启用、`basis`、有效倍率、历史估算、各模型费用占比 |
 | `calibrations` | `id` | 模型倍率校准：`item`、`auth_index`、起止时间、`result` |
-
-`segments`、`k_buckets`、`quota_report_windows` 的列与旧插件 SQLite 的 `cc_segments` / `cc_segment_costs`、`cc_k_buckets`、`quota_report_windows` 一一对应（旧库纳秒时间可直接写入 `*_ns`），以后写导入脚本时只需补上 `instance`。
 
 ### 写失败与数据库不可用
 
@@ -209,7 +217,7 @@ CPA v8 的插件资源路由只支持 GET 且不做 CPA 自身的鉴权，所以
 | `observed_at` | 最近一次额度报告的时间 |
 | `five_hour`, `week` | 窗口：`used_percent`、`reset_at`、`total_usd`（0 表示未知）、`remaining_usd`（已乘安全系数）、`forecast` |
 | `forecast` | `source`（`reading` 按利用率读数 / `spend` 按费用 / `none`）、`per_hour_percent`、`outcome`（`eta` 窗口内耗尽 / `after_reset` 重置前不会耗尽 / `idle` / `reached` / `unknown`）、`exhausts_at`、`lookback_seconds` |
-| `estimate` | `ratio`（点 / 美元）、`usd_per_point`、`clean_blocks`、`total_blocks`、`cold_start_blocks`、`segments`、`excluded_segments`、`basis`（`raw` / `weighted`）、`estimated_at` |
+| `estimate` | `ratio`（点 / 美元）、`usd_per_point`、`clean_blocks`、`total_blocks`、`cold_start_blocks`、`segments`（计入估算的段）、`excluded_segments`（被污染过滤剔除的段）、`voided_segments`（因费用缺失作废的段，不在 `segments` 内）、`basis`（`raw` / `weighted`）、`estimated_at` |
 | `model_weights` | `enabled`、`basis`、`suggestions[]`：`id`、`name`、`models`、`multiplier`（生效倍率）、`source`（`manual` / `calibration` / `estimated` / `default`）、`status`、`estimated_multiplier`、`low`、`high`（95% 区间）、`calibration_id` |
 
 ### 示例
@@ -267,6 +275,7 @@ CPA v8 的插件资源路由只支持 GET 且不做 CPA 自身的鉴权，所以
         "cold_start_blocks": 3,
         "segments": 228,
         "excluded_segments": 0,
+        "voided_segments": 0,
         "basis": "raw",
         "estimated_at": "2026-10-05T10:01:00Z"
       },

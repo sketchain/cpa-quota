@@ -55,17 +55,23 @@ type CostEvent struct {
 	USD float64
 	// Model is the request's normalized billing model; "" when unknown.
 	Model string
-	// Excluded is why the provider's segment rules leave the request out,
-	// "" when it counts.
+	// Excluded is why the request's cost stays out of the segments, "" when
+	// it counts.
 	Excluded string
+	// Unpriced reports that the request's model has no price.
+	Unpriced bool
 }
 
 // Reasons a request's cost stays out of the segments.
 const (
 	// ExcludedOtherLimit: the request was metered against another limit
-	// than the main one, so its report has no main window.
+	// than the main one, so its report has no main window. Only its cost is
+	// left out.
 	ExcludedOtherLimit = "other_limit"
-	// ExcludedUnpriced: the request's model has no price.
+	// ExcludedUnpriced: the request's cost could not be computed, because
+	// its model has no price or its usage is incomplete. The segment it
+	// completes in is voided: its cost is unknown, and counting the request
+	// as free would make the account look cheaper per point.
 	ExcludedUnpriced = "unpriced"
 )
 
@@ -95,8 +101,27 @@ type ExcludedCost struct {
 	// USD and Requests by reason.
 	USD      map[string]float64 `json:"usd,omitempty"`
 	Requests map[string]int64   `json:"requests,omitempty"`
-	// UnpricedModels counts the unpriced requests of each model.
+	// UnpricedModels counts the requests of each model without a price.
 	UnpricedModels map[string]int64 `json:"unpriced_models,omitempty"`
+	// VoidedSegments counts, by reason, the segments voided because a
+	// request completed in them was left out.
+	VoidedSegments map[string]int64 `json:"voided_segments,omitempty"`
+}
+
+// Voided is the number of voided segments.
+func (e ExcludedCost) Voided() int {
+	total := int64(0)
+	for _, count := range e.VoidedSegments {
+		total += count
+	}
+	return int(total)
+}
+
+func (e *ExcludedCost) void(reason string) {
+	if e.VoidedSegments == nil {
+		e.VoidedSegments = map[string]int64{}
+	}
+	e.VoidedSegments[reason]++
 }
 
 func (e *ExcludedCost) add(cost CostEvent) {
@@ -107,7 +132,7 @@ func (e *ExcludedCost) add(cost CostEvent) {
 		e.USD[cost.Excluded] += cost.USD
 	}
 	e.Requests[cost.Excluded]++
-	if cost.Excluded == ExcludedUnpriced {
+	if cost.Unpriced {
 		if e.UnpricedModels == nil {
 			e.UnpricedModels = map[string]int64{}
 		}
@@ -230,6 +255,9 @@ type StreamState struct {
 	AccCost float64 `json:"acc_cost"`
 	// AccModels splits AccCost by model.
 	AccModels map[string]float64 `json:"acc_models,omitempty"`
+	// Void is the reason the armed segment will be voided, "" when it
+	// counts.
+	Void string `json:"void,omitempty"`
 	// K follows the same reports for k evidence with its own cursor, so k can
 	// be rebuilt from history without touching the segments.
 	K KStream `json:"k"`
@@ -258,7 +286,7 @@ type StreamState struct {
 }
 
 func (s *StreamState) breakBlock() {
-	s.BlockStart, s.Armed, s.AccCost, s.AccModels, s.CutAt = time.Time{}, false, 0, nil, 0
+	s.BlockStart, s.Armed, s.AccCost, s.AccModels, s.CutAt, s.Void = time.Time{}, false, 0, nil, 0, ""
 }
 
 // window is the window segments measure.
@@ -277,11 +305,9 @@ func crossesPoint(previous, current float64) bool {
 }
 
 type streamEvent struct {
-	at       time.Time
-	obs      *Observation
-	cost     float64
-	model    string
-	excluded string
+	at   time.Time
+	obs  *Observation
+	cost CostEvent
 }
 
 // Advance consumes the observations and costs that happened after the cursor
@@ -295,7 +321,7 @@ func (s *StreamState) Advance(observations []Observation, costs []CostEvent, unt
 	}
 	for _, cost := range costs {
 		if cost.At.After(s.Cursor) && !cost.At.After(until) {
-			events = append(events, streamEvent{at: cost.At, cost: cost.USD, model: cost.Model, excluded: cost.Excluded})
+			events = append(events, streamEvent{at: cost.At, cost: cost})
 		}
 	}
 	// A report precedes a cost at the same instant: it was evaluated before
@@ -320,16 +346,21 @@ func (s *StreamState) Advance(observations []Observation, costs []CostEvent, unt
 			s.BlockStart = event.at
 		}
 		if event.obs == nil {
-			if event.excluded != "" {
-				s.Excluded.add(CostEvent{USD: event.cost, Model: event.model, Excluded: event.excluded})
+			cost := event.cost
+			if cost.Excluded != "" {
+				s.Excluded.add(cost)
+				// Cost before a block's first rise is discarded anyway.
+				if cost.Excluded == ExcludedUnpriced && s.Armed && s.Void == "" {
+					s.Void = cost.Excluded
+				}
 				continue
 			}
-			if s.Armed && finite(event.cost) && event.cost > 0 {
-				s.AccCost += event.cost
+			if s.Armed && finite(cost.USD) && cost.USD > 0 {
+				s.AccCost += cost.USD
 				if s.AccModels == nil {
 					s.AccModels = map[string]float64{}
 				}
-				s.AccModels[event.model] += event.cost
+				s.AccModels[cost.Model] += cost.USD
 			}
 			continue
 		}
@@ -389,11 +420,16 @@ func (s *StreamState) Advance(observations []Observation, costs []CostEvent, unt
 			s.BlockStart = event.at
 		case stepSame:
 			if delta > gainEpsilon && crossesPoint(track.Max-delta, track.Max) {
-				if s.Armed {
+				switch {
+				case s.Armed && s.Void != "":
+					// The block goes on: the voided segment's gain and cost
+					// both stay out, so the windows around it are unbiased.
+					s.Excluded.void(s.Void)
+				case s.Armed:
 					segments = append(segments, Segment{At: event.at, Block: s.BlockStart, CostUSD: s.AccCost, Gain: roundGain(track.Max - s.CutAt),
 						Models: splitCosts(s.AccCost, s.AccModels)})
 				}
-				s.Armed, s.AccCost, s.AccModels, s.CutAt = true, 0, nil, track.Max
+				s.Armed, s.AccCost, s.AccModels, s.CutAt, s.Void = true, 0, nil, track.Max, ""
 			}
 		}
 	}

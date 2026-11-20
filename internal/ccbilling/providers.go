@@ -63,7 +63,9 @@ func (o ParamOverrides) apply(params Params) Params {
 }
 
 // SegmentRules decide which of an account's requests and reports feed its
-// segments. They are fixed per provider.
+// segments. They are fixed per provider. For every provider, a request in
+// the main window whose cost could not be computed voids the segment it
+// completes in (see ExcludedUnpriced).
 type SegmentRules struct {
 	// MainWindowOnly counts a request's cost only when its own quota report
 	// carries a main window of the provider's limit: a request metered
@@ -71,9 +73,6 @@ type SegmentRules struct {
 	// generation) reports only that pool, and its cost does not move the
 	// main utilization.
 	MainWindowOnly bool `json:"main_window_only"`
-	// ExcludeUnpriced leaves out requests of models without a price, whose
-	// recorded cost of zero would make the account look cheaper per point.
-	ExcludeUnpriced bool `json:"exclude_unpriced"`
 	// PauseWhenExhausted stops segments while a main window is used up or
 	// credits are being consumed: that usage does not move the utilization.
 	PauseWhenExhausted bool `json:"pause_when_exhausted"`
@@ -129,7 +128,7 @@ func DefaultProviderProfile(provider string) (ProviderProfile, bool) {
 		}, Weights: DefaultWeightSettings()}, true
 	case ProviderCodex:
 		return ProviderProfile{LimitKey: "codex", Tiers: []Tier{{ID: TierTeam, Name: "Team", WeeklyUSD: 60}},
-			Rules: SegmentRules{MainWindowOnly: true, ExcludeUnpriced: true, PauseWhenExhausted: true}, Weights: DefaultWeightSettings()}, true
+			Rules: SegmentRules{MainWindowOnly: true, PauseWhenExhausted: true}, Weights: DefaultWeightSettings()}, true
 	}
 	return ProviderProfile{}, false
 }

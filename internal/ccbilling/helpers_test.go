@@ -155,10 +155,16 @@ func newFacts(t *testing.T, host *fakeHost) *facts {
 // request records a request; mainWindow says whether its own report named a
 // main window.
 func (f *facts) request(authIndex, provider string, at time.Time, latency time.Duration, usd float64, model string, priced, mainWindow bool) {
+	f.requestUsage(authIndex, provider, at, latency, usd, model, priced, mainWindow, "complete")
+}
+
+// requestUsage records a request with the given accounting quality.
+func (f *facts) requestUsage(authIndex, provider string, at time.Time, latency time.Duration, usd float64, model string, priced, mainWindow bool,
+	accounting string) {
 	id := f.host.nextID.Add(1)
 	completed := at.Add(time.Duration(max(latency.Milliseconds(), 0)) * time.Millisecond)
 	f.requests.add(testInstance, authIndex, provider, fmt.Sprintf("r%d", id), nanos(at), latency.Milliseconds(), nanos(completed), model, model,
-		usd, priced, mainWindow, "complete")
+		usd, priced, mainWindow, accounting)
 }
 
 // report records a quota report with its windows; credits "" means none.

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/sketchain/cpa-quota/internal/pricing"
 )
 
 // The estimate tables live in the plugin's PostgreSQL schema, which
@@ -258,11 +260,11 @@ func readObservations(ctx context.Context, db *sql.DB, instance string, source Q
 const maxRequestDuration = 2 * time.Hour
 
 // readCosts returns the costs, in USD, of an account's requests completed
-// after from and no later than to. Requests the provider's segment rules
-// leave out are marked with the reason; each request is judged by its own
+// after from and no later than to. Requests whose cost stays out of the
+// segments are marked with the reason; each request is judged by its own
 // record and quota report only.
 func readCosts(ctx context.Context, db *sql.DB, instance string, rules SegmentRules, authIndex string, from, to time.Time) ([]CostEvent, error) {
-	rows, err := db.QueryContext(ctx, `SELECT requested_ns, completed_ns, cost_usd, model, priced, main_window
+	rows, err := db.QueryContext(ctx, `SELECT requested_ns, completed_ns, cost_usd, model, priced, main_window, accounting
 		FROM requests
 		WHERE instance = $1 AND auth_index = $2 AND requested_ns > $3 AND requested_ns <= $4 AND completed_ns > $5 AND completed_ns <= $4
 		ORDER BY requested_ns, id`, instance, authIndex, nanos(from.Add(-maxRequestDuration)), nanos(to), nanos(from))
@@ -274,21 +276,36 @@ func readCosts(ctx context.Context, db *sql.DB, instance string, rules SegmentRu
 	for rows.Next() {
 		var at, completed int64
 		var cost float64
-		var model string
+		var model, accounting string
 		var priced, mainWindow bool
-		if err := rows.Scan(&at, &completed, &cost, &model, &priced, &mainWindow); err != nil {
+		if err := rows.Scan(&at, &completed, &cost, &model, &priced, &mainWindow, &accounting); err != nil {
 			return nil, fmt.Errorf("Read request costs: %w", err)
 		}
 		event := CostEvent{At: timeAt(completed), USD: cost, Model: NormalizeModel(model)}
 		switch {
 		case rules.MainWindowOnly && !mainWindow:
+			// Another pool's request leaves only its own cost out, priced
+			// or not.
 			event.Excluded = ExcludedOtherLimit
-		case rules.ExcludeUnpriced && !priced && cost == 0:
-			event.Excluded = ExcludedUnpriced
+		case !costKnown(priced, accounting):
+			event.Excluded, event.Unpriced = ExcludedUnpriced, !priced
 		}
 		costs = append(costs, event)
 	}
 	return costs, rows.Err()
+}
+
+// costKnown reports whether a request's recorded cost is its real cost:
+// its usage is complete and its model priced, or it reported no usage at
+// all, which costs nothing whatever the model.
+func costKnown(priced bool, accounting string) bool {
+	switch accounting {
+	case pricing.QualityNone:
+		return true
+	case pricing.QualityComplete:
+		return priced
+	}
+	return false
 }
 
 // NormalizeModel is the form model names are compared in.

@@ -13,6 +13,8 @@ type testRequest struct {
 	usd     float64
 	model   string
 	source  string // price source; "none" means unpriced
+	usage   string // accounting quality; "" means complete
+	noUsage bool   // the provider reported no usage
 	credits string
 	windows []testWindow
 }
@@ -31,7 +33,14 @@ func insertRequests(t *testing.T, host *fakeHost, authIndex, provider string, re
 				main = true
 			}
 		}
-		f.request(authIndex, provider, request.at, request.latency, request.usd, request.model, request.source != "none", main)
+		usage := request.usage
+		if usage == "" {
+			usage = "complete"
+		}
+		if request.noUsage {
+			usage = ""
+		}
+		f.requestUsage(authIndex, provider, request.at, request.latency, request.usd, request.model, request.source != "none", main, usage)
 		if len(request.windows) > 0 || request.credits != "" {
 			f.report(authIndex, provider, request.at, request.credits, request.windows...)
 		}
@@ -271,45 +280,64 @@ func TestCodexAccountWithOnlyTheWeeklyWindow(t *testing.T) {
 	}
 }
 
-// Requests metered against another limit, without a report, or of an
-// unpriced model stay out of the segments, and the page shows their cost.
-func TestCodexSegmentsExcludeOtherLimitsAndUnpricedModels(t *testing.T) {
+// Requests metered against another limit or without a report leave only
+// their cost out; a request whose cost is unknown voids its segment.
+func TestCodexSegmentsExcludeOtherLimitsAndVoidUnpriced(t *testing.T) {
 	settings := codexSettings()
-	manager, host := codexManager(t, settings)
-	start := host.now.Add(-2 * 24 * time.Hour)
-	requests := steadyRequests(start, 6, true, nil)
-	clean := steadyRequests(start, 6, true, nil)
+	start := time.Date(2026, 10, 3, 10, 0, 0, 0, time.UTC)
 	reset := start.Add(5 * time.Hour)
-	var extra []testRequest
-	for i, request := range requests {
+	var others, unknown []testRequest
+	for i, request := range steadyRequests(start, 6, true, nil) {
 		at := request.at.Add(20 * time.Second)
 		switch i % 10 {
 		case 1:
 			// A Spark request reports only its own pool.
-			extra = append(extra, testRequest{at: at, usd: 1, model: "gpt-spark", windows: []testWindow{{"bengalfox", 18000, 50, reset}}})
+			others = append(others, testRequest{at: at, usd: 1, model: "gpt-spark", windows: []testWindow{{"bengalfox", 18000, 50, reset}}})
 		case 3:
-			extra = append(extra, testRequest{at: at, usd: 2, model: "gpt-review", windows: []testWindow{{"code-review", 604800, 10, reset}}})
+			others = append(others, testRequest{at: at, usd: 2, model: "gpt-review", windows: []testWindow{{"code-review", 604800, 10, reset}}})
 		case 5:
-			extra = append(extra, testRequest{at: at, usd: 0, model: "gpt-unpriced", source: "none",
+			unknown = append(unknown, testRequest{at: at, usd: 0, model: "gpt-unpriced", source: "none",
 				windows: codexMain(request.windows[1].used, request.windows[0].used, request.windows[1].reset, request.windows[0].reset)})
 		case 7:
 			// No report at all, such as a failed request.
-			extra = append(extra, testRequest{at: at, usd: 3, model: "gpt-test"})
+			others = append(others, testRequest{at: at, usd: 3, model: "gpt-test"})
+		case 9:
+			// Another pool's request of an unpriced model is still only
+			// another pool's request.
+			others = append(others, testRequest{at: at, usd: 0, model: "gpt-spark-next", source: "none",
+				windows: []testWindow{{"bengalfox", 18000, 50, reset}}})
 		}
 	}
-	insertRequests(t, host, "c1", ProviderCodex, append(requests, extra...))
-	account := refreshedAccount(t, manager, "c1")
+	estimate := func(extra []testRequest) AccountView {
+		t.Helper()
+		manager, host := codexManager(t, settings)
+		insertRequests(t, host, "c1", ProviderCodex, append(steadyRequests(start, 6, true, nil), extra...))
+		return refreshedAccount(t, manager, "c1")
+	}
+	reference := estimate(nil)
 
-	other, otherHost := codexManager(t, settings)
-	insertRequests(t, otherHost, "c1", ProviderCodex, clean)
-	reference := refreshedAccount(t, other, "c1")
-	if account.Estimate.Ratio != reference.Estimate.Ratio || account.Estimate.Segments != reference.Estimate.Segments {
-		t.Fatalf("excluded requests changed the estimate: %+v vs %+v", account.Estimate, reference.Estimate)
+	account := estimate(others)
+	if account.Estimate.Ratio != reference.Estimate.Ratio || account.Estimate.Segments != reference.Estimate.Segments ||
+		account.Excluded.Voided() != 0 {
+		t.Fatalf("other limits changed the estimate: %+v vs %+v, excluded %+v", account.Estimate, reference.Estimate, account.Excluded)
 	}
 	excluded := account.Excluded
-	if math.Abs(excluded.USD[ExcludedOtherLimit]-float64(18*1+18*2+18*3)) > 1e-9 || excluded.Requests[ExcludedUnpriced] != 18 ||
-		excluded.UnpricedModels["gpt-unpriced"] != 18 {
+	if math.Abs(excluded.USD[ExcludedOtherLimit]-float64(18*1+18*2+18*3)) > 1e-9 || excluded.Requests[ExcludedOtherLimit] != 18*4 ||
+		len(excluded.UnpricedModels) != 0 {
 		t.Fatalf("excluded = %+v", excluded)
+	}
+
+	// Three unpriced requests per block, each completing in its own
+	// segment: those 18 segments are voided, the rest are unchanged.
+	account = estimate(append(others, unknown...))
+	excluded = account.Excluded
+	if excluded.VoidedSegments[ExcludedUnpriced] != 18 || account.Estimate.Segments != reference.Estimate.Segments-18 ||
+		excluded.Requests[ExcludedUnpriced] != 18 || excluded.UnpricedModels["gpt-unpriced"] != 18 || len(excluded.UnpricedModels) != 1 ||
+		excluded.Requests[ExcludedOtherLimit] != 18*4 {
+		t.Fatalf("segments %d (reference %d), excluded = %+v", account.Estimate.Segments, reference.Estimate.Segments, excluded)
+	}
+	if account.Estimate.TotalBlocks != reference.Estimate.TotalBlocks || account.Estimate.Ratio <= 0 {
+		t.Fatalf("voiding changed the blocks: %+v vs %+v", account.Estimate, reference.Estimate)
 	}
 }
 
