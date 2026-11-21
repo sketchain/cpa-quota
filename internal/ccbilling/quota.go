@@ -8,7 +8,6 @@ import (
 const (
 	StateCold      = "cold"
 	StateEstimated = "estimated"
-	StatePaused    = "paused"
 )
 
 // k sources of an account in the quota API.
@@ -18,31 +17,6 @@ const (
 	KSourceDefault = "default"
 	KSourceNone    = "none"
 )
-
-// Subscription names by provider.
-const (
-	SubscriptionClaude  = "claude"
-	SubscriptionChatGPT = "chatgpt"
-)
-
-// SubscriptionOf is the subscription a provider's accounts hold.
-func SubscriptionOf(provider string) string {
-	if provider == ProviderCodex {
-		return SubscriptionChatGPT
-	}
-	return SubscriptionClaude
-}
-
-// ProviderOf is the provider of a subscription; "" when unknown.
-func ProviderOf(subscription string) string {
-	switch subscription {
-	case SubscriptionClaude:
-		return ProviderClaude
-	case SubscriptionChatGPT:
-		return ProviderCodex
-	}
-	return ""
-}
 
 // WindowForecast is when a window reaches 100% at the current rate.
 type WindowForecast struct {
@@ -105,7 +79,7 @@ type ModelWeightSuggestion struct {
 	CalibrationID int64    `json:"calibration_id,omitempty"`
 }
 
-// ModelWeights is the model quota multipliers of an account's provider.
+// ModelWeights is the model quota multipliers.
 type ModelWeights struct {
 	// Enabled reports whether the estimate converts costs with them.
 	Enabled     bool                    `json:"enabled"`
@@ -116,19 +90,12 @@ type ModelWeights struct {
 // AccountQuota is one account in the quota API, and the detail column of
 // the estimates table.
 type AccountQuota struct {
-	AuthIndex    string     `json:"auth_index"`
-	Provider     string     `json:"provider"`
-	Subscription string     `json:"subscription"`
-	Tier         string     `json:"tier"`
-	State        string     `json:"state"`
-	PauseReason  string     `json:"pause_reason,omitempty"`
-	PausedSince  *time.Time `json:"paused_since,omitempty"`
-	K            *float64   `json:"k"`
-	KSource      string     `json:"k_source"`
-	KAuto        *float64   `json:"k_auto"`
-	// SegmentWindow is the window segments measure: 5h, or 7d for accounts
-	// whose reports have no 5-hour window.
-	SegmentWindow string `json:"segment_window"`
+	AuthIndex string   `json:"auth_index"`
+	Tier      string   `json:"tier"`
+	State     string   `json:"state"`
+	K         *float64 `json:"k"`
+	KSource   string   `json:"k_source"`
+	KAuto     *float64 `json:"k_auto"`
 	// TotalsFrom is estimated, or tier while the totals are the tier's.
 	TotalsFrom   string          `json:"totals_from"`
 	SafetyFactor float64         `json:"safety_factor"`
@@ -174,17 +141,11 @@ func quotas(snap *snapshot, latest map[string]Observation, now time.Time) []Acco
 func accountQuota(snap *snapshot, latest map[string]Observation, authIndex string, now time.Time) AccountQuota {
 	cached := snap.accounts[authIndex]
 	status := accountStatus(snap, latest, authIndex, now)
-	params := snap.settings.ParamsFor(status.Provider)
-	quota := AccountQuota{AuthIndex: authIndex, Provider: status.Provider, Subscription: SubscriptionOf(status.Provider), Tier: status.Tier,
-		K: floatCopy(status.K), KAuto: floatCopy(status.KAuto), SegmentWindow: segmentWindow(cached.window), TotalsFrom: status.TotalsFrom,
-		SafetyFactor: params.SafetyFactor, ObservedAt: timePointer(status.ObservedAt)}
-	switch {
-	case status.Paused:
-		quota.State, quota.PauseReason, quota.PausedSince = StatePaused, status.PauseReason, timePointer(status.PausedSince)
-	case status.ColdStart:
+	params := snap.settings.AccountParams()
+	quota := AccountQuota{AuthIndex: authIndex, Tier: status.Tier, K: floatCopy(status.K), KAuto: floatCopy(status.KAuto),
+		TotalsFrom: status.TotalsFrom, SafetyFactor: params.SafetyFactor, ObservedAt: timePointer(status.ObservedAt), State: StateEstimated}
+	if status.ColdStart {
 		quota.State = StateCold
-	default:
-		quota.State = StateEstimated
 	}
 	switch status.KSource {
 	case SourceManual:
@@ -219,23 +180,23 @@ func accountQuota(snap *snapshot, latest map[string]Observation, authIndex strin
 	}
 	quota.FiveHour = window(status.Used5h, status.Reset5h, status.FiveHourTotal, status.RemainingFiveHour, forecast.FiveHour, forecast.Window5h)
 	quota.Week = window(status.Used7d, status.Reset7d, status.WeeklyTotal, status.RemainingWeek, forecast.Week, forecast.Window7d)
-	weights := providerWeights(snap, status.Provider)
+	weights := estimateWeights(snap)
 	quota.Estimate = EstimateSummary{Ratio: status.Ratio, CleanBlocks: status.CleanBlocks, TotalBlocks: status.TotalBlocks,
 		ColdStartBlocks: params.ColdStartBlocks, Segments: status.Estimate.Segments, ExcludedSegments: status.ExcludedSegments,
 		VoidedSegments: cached.excluded.Voided(), Basis: weights.Basis, EstimatedAt: timePointer(snap.at)}
 	if status.Ratio > 0 {
 		quota.Estimate.USDPerPoint = 1 / status.Ratio
 	}
-	quota.ModelWeights = ModelWeights{Enabled: snap.settings.provider(status.Provider).Weights.Enabled, Basis: weights.Basis,
+	quota.ModelWeights = ModelWeights{Enabled: snap.settings.Weights.Enabled, Basis: weights.Basis,
 		Suggestions: []ModelWeightSuggestion{}}
 	estimates := map[string]ItemEstimate{}
-	for _, item := range snap.weights[status.Provider].estimate.Items {
+	for _, item := range snap.weights.estimate.Items {
 		estimates[item.ID] = item
 	}
 	effective := weights.Weights
 	if len(effective) == 0 {
 		// Before the first snapshot the items are known, their multipliers not.
-		for _, item := range snap.settings.provider(status.Provider).Weights.Items {
+		for _, item := range snap.settings.Weights.Items {
 			effective = append(effective, EffectiveWeight{ID: item.ID, Name: item.Name, Models: item.Models, Multiplier: 1,
 				Source: WeightSourceDefault, Status: WeightInsufficient})
 			if item.Manual != nil {

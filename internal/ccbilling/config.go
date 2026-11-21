@@ -1,5 +1,4 @@
-// Package ccbilling estimates the quota of subscription accounts (Claude, and
-// ChatGPT through CLIProxyAPI's Codex channel) in USD.
+// Package ccbilling estimates the quota of Claude subscription accounts in USD.
 //
 // It estimates each account's quota from what the plugin records passively:
 // the cost of every request and the 5-hour and 7-day utilization its response
@@ -53,26 +52,20 @@ type Params struct {
 	// TierWeeklyUSD and TierK are the default weekly totals, in USD, used
 	// while an account is in cold start, and the default weekly/5-hour
 	// ratios, used while an account has neither a manual nor an estimated k,
-	// of one provider's tiers. Settings keep them in the provider profiles;
-	// ParamsFor fills them in. In stored settings they only appear in those
-	// saved before providers existed, which held Claude's.
+	// of the tiers. Settings keep them in their tiers; AccountParams fills
+	// them in.
 	TierWeeklyUSD map[string]float64 `json:"tier_weekly_usd,omitempty"`
 	TierK         map[string]float64 `json:"tier_k,omitempty"`
 	// SafetyFactor discounts an account's estimated remaining capacity.
 	SafetyFactor float64 `json:"safety_factor"`
 
-	// defaultTier is the tier of accounts without one; rules decide what
-	// feeds the segments. ParamsFor sets both for a provider.
+	// defaultTier is the tier of accounts without one; AccountParams sets it.
 	defaultTier string
-	rules       SegmentRules
 }
 
 // AccountSettings are the operator's per-account choices.
 type AccountSettings struct {
-	// Provider is the account's provider. Accounts in a pool take their
-	// pool's; it keeps the provider of an account outside every pool.
-	Provider string `json:"provider,omitempty"`
-	Tier     string `json:"tier,omitempty"`
+	Tier string `json:"tier,omitempty"`
 	// ManualK overrides the estimated weekly/5-hour ratio when set.
 	ManualK *float64 `json:"manual_k,omitempty"`
 }
@@ -80,8 +73,10 @@ type AccountSettings struct {
 // Settings is everything the operator configures for the estimates.
 type Settings struct {
 	Params Params `json:"params"`
-	// Providers holds each supported provider's profile.
-	Providers map[string]ProviderProfile `json:"providers"`
+	// Tiers are the subscription tiers in display order.
+	Tiers []Tier `json:"tiers"`
+	// Weights are the model quota multipliers.
+	Weights WeightSettings `json:"weights"`
 	// Accounts are the tracked accounts by auth index.
 	Accounts map[string]AccountSettings `json:"accounts"`
 }
@@ -107,8 +102,8 @@ func DefaultParams() Params {
 	}
 }
 
-// DefaultGlobalParams are the defaults of the parameters every provider
-// shares; the tier tables belong to the provider profiles.
+// DefaultGlobalParams are the defaults of the parameters without the tier
+// tables, which belong to the tiers.
 func DefaultGlobalParams() Params {
 	params := DefaultParams()
 	params.TierWeeklyUSD, params.TierK, params.defaultTier = nil, nil, ""
@@ -116,7 +111,7 @@ func DefaultGlobalParams() Params {
 }
 
 func DefaultSettings() Settings {
-	return Settings{Params: DefaultGlobalParams(), Providers: DefaultProviders(), Accounts: map[string]AccountSettings{}}
+	return Settings{Params: DefaultGlobalParams(), Tiers: DefaultTiers(), Weights: DefaultWeightSettings(), Accounts: map[string]AccountSettings{}}
 }
 
 func (p Params) gap() time.Duration { return time.Duration(p.BlockGapMinutes * float64(time.Minute)) }
@@ -128,8 +123,8 @@ func (p Params) retention() time.Duration {
 }
 
 // fallbackTier is the tier an account without a known tier is treated as: the
-// provider's first, which for Claude is the smallest, so an unconfigured
-// account errs on the conservative side.
+// first, which is the smallest, so an unconfigured account errs on the
+// conservative side.
 func (p Params) fallbackTier() string {
 	if p.defaultTier != "" {
 		return p.defaultTier
@@ -137,7 +132,7 @@ func (p Params) fallbackTier() string {
 	return TierPro
 }
 
-// resolveTier is tier when the provider has it, else the fallback tier.
+// resolveTier is tier when it is known, else the fallback tier.
 func (p Params) resolveTier(tier string) string {
 	if _, ok := p.TierWeeklyUSD[tier]; ok {
 		return tier
@@ -193,51 +188,30 @@ func (p Params) validate() error {
 }
 
 // Normalized validates the settings and returns a canonical copy. Missing
-// provider profiles are the built-in ones. Normalizing normalized settings
-// changes nothing.
+// tiers are the built-in ones. Normalizing normalized settings changes
+// nothing.
 func (s Settings) Normalized() (Settings, error) {
 	global := s.Params
-	global.TierWeeklyUSD, global.TierK, global.defaultTier, global.rules = nil, nil, "", SegmentRules{}
+	global.TierWeeklyUSD, global.TierK, global.defaultTier = nil, nil, ""
 	if err := global.validate(); err != nil {
 		return Settings{}, err
 	}
-	for name := range s.Providers {
-		if _, known := DefaultProviderProfile(name); !known {
-			return Settings{}, fmt.Errorf("Unknown provider %q", name)
-		}
+	tiers, err := normalizedTiers(s.Tiers)
+	if err != nil {
+		return Settings{}, err
 	}
-	providers := make(map[string]ProviderProfile, len(Providers))
-	for _, name := range Providers {
-		input, ok := s.Providers[name]
-		if !ok {
-			input, _ = DefaultProviderProfile(name)
-		}
-		profile, err := normalizedProvider(name, input, global)
-		if err != nil {
-			return Settings{}, err
-		}
-		providers[name] = profile
+	weights, err := s.Weights.normalized()
+	if err != nil {
+		return Settings{}, err
 	}
-	out := Settings{Params: global, Providers: providers, Accounts: make(map[string]AccountSettings, len(s.Accounts))}
+	out := Settings{Params: global, Tiers: tiers, Weights: weights, Accounts: make(map[string]AccountSettings, len(s.Accounts))}
 	for index, account := range s.Accounts {
 		index = strings.TrimSpace(index)
 		if index == "" {
 			continue
 		}
-		account.Provider = strings.TrimSpace(account.Provider)
-		provider := account.Provider
-		if provider == "" {
-			provider = ProviderClaude
-		} else if provider == ProviderClaude {
-			// Claude is the default; settings leave it out.
-			account.Provider = ""
-		}
-		profile, known := providers[provider]
-		if !known {
-			return Settings{}, fmt.Errorf("Unknown provider %q", provider)
-		}
-		if account.Tier != "" && !profile.hasTier(account.Tier) {
-			return Settings{}, fmt.Errorf("Tier %q is not a tier of %s accounts", account.Tier, providerLabel(provider))
+		if account.Tier != "" && !hasTier(tiers, account.Tier) {
+			return Settings{}, fmt.Errorf("Tier %q is not a Claude tier", account.Tier)
 		}
 		if account.ManualK != nil && (!finite(*account.ManualK) || *account.ManualK < 1 || *account.ManualK > 100) {
 			return Settings{}, fmt.Errorf("Manual k must be from 1 to 100")

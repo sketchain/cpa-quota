@@ -177,7 +177,6 @@ plugins:
       api_token: "$api_token"
       admin_token: "$admin_token"
       price_url: "$upstream/ratio_config"
-      subscription: claude
       tier: max5x
       # The dummy upstream is reached with an API key credential.
       account_auth_types: [oauth, apikey]
@@ -232,8 +231,8 @@ EOF
   curl -fsS -o "$body" -H "Authorization: Bearer $api_token" "$base/v0/resource/plugins/cpa-quota/quota"
   jq -e --arg instance "$instance" '
     .plugin == "cpa-quota" and .version != "" and .instance == $instance and .database.status == "ok" and
-    .price_table.origin == "remote" and .price_table.models == 1 and .subscription == "claude" and .tier == "max5x" and
-    (.accounts | length) == 1 and .accounts[0].provider == "claude" and .accounts[0].state == "cold" and
+    .price_table.origin == "remote" and .price_table.models == 1 and (has("subscription") | not) and .tier == "max5x" and
+    (.accounts | length) == 1 and (.accounts[0] | has("provider") | not) and .accounts[0].state == "cold" and
     .accounts[0].k_source == "default" and .accounts[0].week.total_usd == 1250 and
     .accounts[0].five_hour.used_percent > 0 and .accounts[0].week.remaining_usd > 0' "$body" >/dev/null ||
     fail "quota body: $(cat "$body")"

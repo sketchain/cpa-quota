@@ -71,7 +71,7 @@ func newTestManager(host *fakeHost) *Manager {
 }
 
 // configure applies settings, tracking the given accounts with the
-// template's provider and tier.
+// template's tier.
 func configure(t *testing.T, manager *Manager, settings Settings, template AccountSettings, accounts ...string) {
 	t.Helper()
 	settings.Accounts = map[string]AccountSettings{}
@@ -143,40 +143,34 @@ type facts struct {
 
 func newFacts(t *testing.T, host *fakeHost) *facts {
 	f := &facts{host: host,
-		requests: newBatch(t, host.db, "requests", "instance", "auth_index", "provider", "request_id", "requested_ns", "latency_ms",
-			"completed_ns", "model", "upstream_model", "cost_usd", "priced", "main_window", "accounting"),
-		reports: newBatch(t, host.db, "quota_reports", "id", "instance", "auth_index", "provider", "request_id", "at_ns", "credit_balance"),
-		windows: newBatch(t, host.db, "quota_report_windows", "report_id", "instance", "auth_index", "provider", "limit_key", "seconds",
+		requests: newBatch(t, host.db, "requests", "instance", "auth_index", "request_id", "requested_ns", "latency_ms",
+			"completed_ns", "model", "upstream_model", "cost_usd", "priced", "accounting"),
+		reports: newBatch(t, host.db, "quota_reports", "id", "instance", "auth_index", "request_id", "at_ns"),
+		windows: newBatch(t, host.db, "quota_report_windows", "report_id", "instance", "auth_index", "limit_key", "seconds",
 			"at_ns", "used_percent", "reset_ns")}
 	f.windows.before = []*batch{f.reports}
 	return f
 }
 
-// request records a request; mainWindow says whether its own report named a
-// main window.
-func (f *facts) request(authIndex, provider string, at time.Time, latency time.Duration, usd float64, model string, priced, mainWindow bool) {
-	f.requestUsage(authIndex, provider, at, latency, usd, model, priced, mainWindow, "complete")
+// request records a priced or unpriced request with complete usage.
+func (f *facts) request(authIndex string, at time.Time, latency time.Duration, usd float64, model string, priced bool) {
+	f.requestUsage(authIndex, at, latency, usd, model, priced, "complete")
 }
 
 // requestUsage records a request with the given accounting quality.
-func (f *facts) requestUsage(authIndex, provider string, at time.Time, latency time.Duration, usd float64, model string, priced, mainWindow bool,
-	accounting string) {
+func (f *facts) requestUsage(authIndex string, at time.Time, latency time.Duration, usd float64, model string, priced bool, accounting string) {
 	id := f.host.nextID.Add(1)
 	completed := at.Add(time.Duration(max(latency.Milliseconds(), 0)) * time.Millisecond)
-	f.requests.add(testInstance, authIndex, provider, fmt.Sprintf("r%d", id), nanos(at), latency.Milliseconds(), nanos(completed), model, model,
-		usd, priced, mainWindow, accounting)
+	f.requests.add(testInstance, authIndex, fmt.Sprintf("r%d", id), nanos(at), latency.Milliseconds(), nanos(completed), model, model,
+		usd, priced, accounting)
 }
 
-// report records a quota report with its windows; credits "" means none.
-func (f *facts) report(authIndex, provider string, at time.Time, credits string, windows ...testWindow) {
+// report records a quota report with its windows.
+func (f *facts) report(authIndex string, at time.Time, windows ...testWindow) {
 	id := f.host.nextID.Add(1)
-	var balance any
-	if credits != "" {
-		balance = credits
-	}
-	f.reports.add(id, testInstance, authIndex, provider, fmt.Sprintf("q%d", id), nanos(at), balance)
+	f.reports.add(id, testInstance, authIndex, fmt.Sprintf("q%d", id), nanos(at))
 	for _, window := range windows {
-		f.windows.add(id, testInstance, authIndex, provider, window.limit, window.seconds, nanos(at), window.used, nanos(window.reset))
+		f.windows.add(id, testInstance, authIndex, window.limit, window.seconds, nanos(at), window.used, nanos(window.reset))
 	}
 }
 

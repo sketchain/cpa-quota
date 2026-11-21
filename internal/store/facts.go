@@ -18,7 +18,6 @@ func nanos(at time.Time) int64 {
 type Request struct {
 	Instance      string
 	AuthIndex     string
-	Provider      string
 	RequestID     string
 	RequestedAt   time.Time
 	Latency       time.Duration
@@ -37,11 +36,8 @@ type Request struct {
 	Accounting       string
 	CostUSD          float64
 	Priced           bool
-	// MainWindow reports that the request's own quota report carried a
-	// window of the provider's main limit.
-	MainWindow bool
-	Failed     bool
-	StatusCode int
+	Failed           bool
+	StatusCode       int
 }
 
 // CompletedAt is when the request's usage counted against the account.
@@ -58,26 +54,20 @@ type ReportWindow struct {
 }
 
 // QuotaReport is what one response reported about the account's quota. At is
-// the request's start, when the provider evaluated it.
+// the request's start, when Claude evaluated it.
 type QuotaReport struct {
-	Instance         string
-	AuthIndex        string
-	Provider         string
-	RequestID        string
-	At               time.Time
-	Plan             string
-	CreditBalance    *float64
-	CreditsUnlimited *bool
-	LimitReached     bool
-	Windows          []ReportWindow
+	Instance  string
+	AuthIndex string
+	RequestID string
+	At        time.Time
+	Windows   []ReportWindow
 }
 
-// SafeguardEvent is a request the provider refused for policy reasons.
+// SafeguardEvent is a request Claude refused for policy reasons.
 type SafeguardEvent struct {
 	Instance   string
 	At         time.Time
 	AuthIndex  string
-	Provider   string
 	Model      string
 	Category   string
 	Reason     string
@@ -93,24 +83,23 @@ func RecordWrite(request *Request, report *QuotaReport) Write {
 	return Write{Kind: "usage", Apply: func(ctx context.Context, tx *sql.Tx) error {
 		if request != nil {
 			r := request
-			if _, err := tx.ExecContext(ctx, `INSERT INTO requests (instance, auth_index, provider, request_id, requested_ns, latency_ms, completed_ns,
+			if _, err := tx.ExecContext(ctx, `INSERT INTO requests (instance, auth_index, request_id, requested_ns, latency_ms, completed_ns,
 				model, upstream_model, service_tier, stream, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-				total_tokens, accounting, cost_usd, priced, main_window, failed, status_code)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+				total_tokens, accounting, cost_usd, priced, failed, status_code)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 				ON CONFLICT (instance, request_id) WHERE request_id <> '' DO NOTHING`,
-				r.Instance, r.AuthIndex, r.Provider, r.RequestID, nanos(r.RequestedAt), r.Latency.Milliseconds(), nanos(r.CompletedAt()),
+				r.Instance, r.AuthIndex, r.RequestID, nanos(r.RequestedAt), r.Latency.Milliseconds(), nanos(r.CompletedAt()),
 				r.Model, r.UpstreamModel, r.ServiceTier, r.Stream, r.InputTokens, r.CacheReadTokens, r.CacheWriteTokens, r.OutputTokens,
-				r.ReasoningTokens, r.TotalTokens, r.Accounting, r.CostUSD, r.Priced, r.MainWindow, r.Failed, r.StatusCode); err != nil {
+				r.ReasoningTokens, r.TotalTokens, r.Accounting, r.CostUSD, r.Priced, r.Failed, r.StatusCode); err != nil {
 				return err
 			}
 		}
 		if report != nil {
 			q := report
 			var id int64
-			err := tx.QueryRowContext(ctx, `INSERT INTO quota_reports (instance, auth_index, provider, request_id, at_ns, plan, credit_balance,
-				credits_unlimited, limit_reached) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			err := tx.QueryRowContext(ctx, `INSERT INTO quota_reports (instance, auth_index, request_id, at_ns) VALUES ($1, $2, $3, $4)
 				ON CONFLICT (instance, request_id) WHERE request_id <> '' DO NOTHING RETURNING id`,
-				q.Instance, q.AuthIndex, q.Provider, q.RequestID, nanos(q.At), q.Plan, q.CreditBalance, q.CreditsUnlimited, q.LimitReached).Scan(&id)
+				q.Instance, q.AuthIndex, q.RequestID, nanos(q.At)).Scan(&id)
 			switch {
 			case err == sql.ErrNoRows:
 				return nil
@@ -118,9 +107,9 @@ func RecordWrite(request *Request, report *QuotaReport) Write {
 				return err
 			}
 			for _, w := range q.Windows {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO quota_report_windows (report_id, instance, auth_index, provider, limit_key, seconds, at_ns,
-					used_percent, reset_ns) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING`,
-					id, q.Instance, q.AuthIndex, q.Provider, w.LimitKey, w.Seconds, nanos(q.At), w.UsedPercent, nanos(w.ResetAt)); err != nil {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO quota_report_windows (report_id, instance, auth_index, limit_key, seconds, at_ns,
+					used_percent, reset_ns) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
+					id, q.Instance, q.AuthIndex, w.LimitKey, w.Seconds, nanos(q.At), w.UsedPercent, nanos(w.ResetAt)); err != nil {
 					return err
 				}
 			}
@@ -132,10 +121,10 @@ func RecordWrite(request *Request, report *QuotaReport) Write {
 // SafeguardWrite stores a safeguard event once per request ID.
 func SafeguardWrite(event SafeguardEvent) Write {
 	return Write{Kind: "safeguard event", Apply: func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO safeguard_events (instance, at_ns, auth_index, provider, model, category, reason, request_id,
-			status_code, stream) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		_, err := tx.ExecContext(ctx, `INSERT INTO safeguard_events (instance, at_ns, auth_index, model, category, reason, request_id,
+			status_code, stream) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (instance, request_id) WHERE request_id <> '' DO NOTHING`,
-			event.Instance, nanos(event.At), event.AuthIndex, event.Provider, event.Model, event.Category, event.Reason, event.RequestID,
+			event.Instance, nanos(event.At), event.AuthIndex, event.Model, event.Category, event.Reason, event.RequestID,
 			event.StatusCode, event.Stream)
 		return err
 	}}

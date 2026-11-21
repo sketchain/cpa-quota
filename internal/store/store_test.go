@@ -97,7 +97,7 @@ func newStore(t *testing.T, dsn, schema string, maxPending int) (*store.Store, *
 }
 
 func request(instance string, n int) *store.Request {
-	return &store.Request{Instance: instance, AuthIndex: "a1", Provider: "claude", RequestID: fmt.Sprintf("req-%d", n),
+	return &store.Request{Instance: instance, AuthIndex: "a1", RequestID: fmt.Sprintf("req-%d", n),
 		RequestedAt: time.Date(2026, 11, 1, 0, 0, n, 0, time.UTC), Latency: 1500 * time.Millisecond, Model: "claude-opus-4-8",
 		CostUSD: float64(n), Priced: true, Accounting: "complete"}
 }
@@ -215,10 +215,9 @@ func TestInstancesAreIsolated(t *testing.T) {
 	if err := s.Open(); err != nil {
 		t.Fatal(err)
 	}
-	balance := 12.5
 	for _, instance := range []string{"i1", "i2"} {
-		report := &store.QuotaReport{Instance: instance, AuthIndex: "a1", Provider: "codex", RequestID: "req-1", At: time.Now(),
-			CreditBalance: &balance, Windows: []store.ReportWindow{{LimitKey: "codex", Seconds: 18000, UsedPercent: 3}}}
+		report := &store.QuotaReport{Instance: instance, AuthIndex: "a1", RequestID: "req-1", At: time.Now(),
+			Windows: []store.ReportWindow{{LimitKey: "unified", Seconds: 18000, UsedPercent: 3}}}
 		s.Submit(store.RecordWrite(request(instance, 1), report))
 	}
 	for _, instance := range []string{"i1", "i2"} {

@@ -14,7 +14,7 @@ import (
 type persistedState struct {
 	blocks  map[string]string
 	trend   map[string]TrendDay
-	weights map[string]string
+	weights string
 }
 
 // persistLocked needs refreshMu. It saves a snapshot's results to the
@@ -22,7 +22,7 @@ type persistedState struct {
 // transaction, for downstream readers.
 func (m *Manager) persistLocked(snap *snapshot, now time.Time) error {
 	latest := m.live()
-	next := persistedState{blocks: map[string]string{}, trend: map[string]TrendDay{}, weights: map[string]string{}}
+	next := persistedState{blocks: map[string]string{}, trend: map[string]TrendDay{}}
 	return m.withDB(m.DBTimeout, func(ctx context.Context, db *sql.DB) error {
 		previous := m.persisted
 		err := transact(ctx, db, func(tx *sql.Tx) error {
@@ -53,43 +53,39 @@ func (m *Manager) persistLocked(snap *snapshot, now time.Time) error {
 					}
 				}
 			}
-			for provider, weights := range snap.weights {
-				if provider != m.trackedProvider() {
-					continue
-				}
-				row := struct {
-					Enabled   bool              `json:"enabled"`
-					Basis     string            `json:"basis"`
-					Effective []EffectiveWeight `json:"effective"`
-					Estimate  WeightEstimate    `json:"estimate"`
-					Models    []ModelUsage      `json:"models"`
-				}{snap.settings.provider(provider).Weights.Enabled, weights.basis, weights.effective, weights.estimate, weights.models}
-				if row.Effective == nil {
-					row.Effective = []EffectiveWeight{}
-				}
-				if row.Estimate.Items == nil {
-					row.Estimate.Items = []ItemEstimate{}
-				}
-				if row.Models == nil {
-					row.Models = []ModelUsage{}
-				}
-				encoded, err := json.Marshal(row)
-				if err != nil {
-					return err
-				}
-				next.weights[provider] = string(encoded)
-				if previous.weights[provider] == string(encoded) {
-					continue
-				}
-				effective, _ := json.Marshal(row.Effective)
-				estimate, _ := json.Marshal(row.Estimate)
-				models, _ := json.Marshal(row.Models)
-				if _, err := tx.ExecContext(ctx, `INSERT INTO model_weights (instance, provider, enabled, basis, effective, estimate, models, updated_at)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, now()) ON CONFLICT (instance, provider) DO UPDATE SET enabled = excluded.enabled,
-					basis = excluded.basis, effective = excluded.effective, estimate = excluded.estimate, models = excluded.models,
-					updated_at = excluded.updated_at`, m.Instance, provider, row.Enabled, row.Basis, string(effective), string(estimate), string(models)); err != nil {
-					return fmt.Errorf("Save model weights: %w", err)
-				}
+			weights := snap.weights
+			row := struct {
+				Enabled   bool              `json:"enabled"`
+				Basis     string            `json:"basis"`
+				Effective []EffectiveWeight `json:"effective"`
+				Estimate  WeightEstimate    `json:"estimate"`
+				Models    []ModelUsage      `json:"models"`
+			}{snap.settings.Weights.Enabled, weights.basis, weights.effective, weights.estimate, weights.models}
+			if row.Effective == nil {
+				row.Effective = []EffectiveWeight{}
+			}
+			if row.Estimate.Items == nil {
+				row.Estimate.Items = []ItemEstimate{}
+			}
+			if row.Models == nil {
+				row.Models = []ModelUsage{}
+			}
+			encoded, err := json.Marshal(row)
+			if err != nil {
+				return err
+			}
+			next.weights = string(encoded)
+			if previous.weights == next.weights {
+				return nil
+			}
+			effective, _ := json.Marshal(row.Effective)
+			estimate, _ := json.Marshal(row.Estimate)
+			models, _ := json.Marshal(row.Models)
+			if _, err := tx.ExecContext(ctx, `INSERT INTO model_weights (instance, enabled, basis, effective, estimate, models, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, now()) ON CONFLICT (instance) DO UPDATE SET enabled = excluded.enabled,
+				basis = excluded.basis, effective = excluded.effective, estimate = excluded.estimate, models = excluded.models,
+				updated_at = excluded.updated_at`, m.Instance, row.Enabled, row.Basis, string(effective), string(estimate), string(models)); err != nil {
+				return fmt.Errorf("Save model weights: %w", err)
 			}
 			return nil
 		})
@@ -115,12 +111,12 @@ func saveEstimate(ctx context.Context, tx *sql.Tx, instance string, quota Accoun
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO estimates (instance, auth_index, provider, subscription, tier, state, pause_reason, segment_window,
+	_, err = tx.ExecContext(ctx, `INSERT INTO estimates (instance, auth_index, tier, state,
 		basis, k, k_source, totals_from, safety_factor, used_5h, reset_5h, used_7d, reset_7d, five_hour_total_usd, weekly_total_usd,
 		remaining_five_hour_usd, remaining_week_usd, clean_blocks, total_blocks, segments, excluded_segments, ratio, observed_at, estimated_at, detail)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
-		ON CONFLICT (instance, auth_index) DO UPDATE SET provider = excluded.provider, subscription = excluded.subscription, tier = excluded.tier,
-		state = excluded.state, pause_reason = excluded.pause_reason, segment_window = excluded.segment_window, basis = excluded.basis,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+		ON CONFLICT (instance, auth_index) DO UPDATE SET tier = excluded.tier,
+		state = excluded.state, basis = excluded.basis,
 		k = excluded.k, k_source = excluded.k_source, totals_from = excluded.totals_from, safety_factor = excluded.safety_factor,
 		used_5h = excluded.used_5h, reset_5h = excluded.reset_5h, used_7d = excluded.used_7d, reset_7d = excluded.reset_7d,
 		five_hour_total_usd = excluded.five_hour_total_usd, weekly_total_usd = excluded.weekly_total_usd,
@@ -128,8 +124,7 @@ func saveEstimate(ctx context.Context, tx *sql.Tx, instance string, quota Accoun
 		clean_blocks = excluded.clean_blocks, total_blocks = excluded.total_blocks, segments = excluded.segments,
 		excluded_segments = excluded.excluded_segments, ratio = excluded.ratio, observed_at = excluded.observed_at,
 		estimated_at = excluded.estimated_at, detail = excluded.detail`,
-		instance, quota.AuthIndex, quota.Provider, quota.Subscription, quota.Tier, quota.State, quota.PauseReason, quota.SegmentWindow,
-		quota.Estimate.Basis, quota.K, quota.KSource, quota.TotalsFrom, quota.SafetyFactor, quota.FiveHour.UsedPercent,
+		instance, quota.AuthIndex, quota.Tier, quota.State, quota.Estimate.Basis, quota.K, quota.KSource, quota.TotalsFrom, quota.SafetyFactor, quota.FiveHour.UsedPercent,
 		nullableTime(quota.FiveHour.ResetAt), quota.Week.UsedPercent, nullableTime(quota.Week.ResetAt), quota.FiveHour.TotalUSD, quota.Week.TotalUSD,
 		quota.FiveHour.RemainingUSD, quota.Week.RemainingUSD, quota.Estimate.CleanBlocks, quota.Estimate.TotalBlocks, quota.Estimate.Segments,
 		quota.Estimate.ExcludedSegments, quota.Estimate.Ratio, nullableTime(quota.ObservedAt), at.UTC(), string(detail))

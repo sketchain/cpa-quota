@@ -122,16 +122,15 @@ type EstimatesStatus struct {
 
 // QuotaResponse is the quota API's body.
 type QuotaResponse struct {
-	Plugin       string                   `json:"plugin"`
-	Version      string                   `json:"version"`
-	Instance     string                   `json:"instance"`
-	GeneratedAt  time.Time                `json:"generated_at"`
-	Subscription string                   `json:"subscription"`
-	Tier         string                   `json:"tier"`
-	PriceTable   PriceStatus              `json:"price_table"`
-	Database     DatabaseStatus           `json:"database"`
-	Estimates    EstimatesStatus          `json:"estimates"`
-	Accounts     []ccbilling.AccountQuota `json:"accounts"`
+	Plugin      string                   `json:"plugin"`
+	Version     string                   `json:"version"`
+	Instance    string                   `json:"instance"`
+	GeneratedAt time.Time                `json:"generated_at"`
+	Tier        string                   `json:"tier"`
+	PriceTable  PriceStatus              `json:"price_table"`
+	Database    DatabaseStatus           `json:"database"`
+	Estimates   EstimatesStatus          `json:"estimates"`
+	Accounts    []ccbilling.AccountQuota `json:"accounts"`
 }
 
 // Quota builds the quota API's body. It refreshes the estimates when their
@@ -142,10 +141,10 @@ func (a *App) Quota() QuotaResponse {
 	settings := manager.Settings()
 	tier := config.Tier
 	if tier == "" {
-		tier = settings.Providers[config.Provider()].Tiers[0].ID
+		tier = settings.Tiers[0].ID
 	}
 	response := QuotaResponse{Plugin: PluginID, Version: Version, Instance: config.Instance, GeneratedAt: a.Now().UTC(),
-		Subscription: config.Subscription, Tier: tier, PriceTable: prices.status(config.PriceURL), Accounts: manager.Quotas()}
+		Tier: tier, PriceTable: prices.status(config.PriceURL), Accounts: manager.Quotas()}
 	status := db.Status()
 	response.Database = DatabaseStatus{Status: "ok", LastError: status.LastError, PendingWrites: status.Pending, DroppedWrites: status.Dropped,
 		SchemaVersion: status.SchemaVersion}

@@ -98,31 +98,23 @@ func TestLookupKeysAndBillingModel(t *testing.T) {
 	}
 }
 
-func TestSplitFollowsProviderSemantics(t *testing.T) {
+func TestSplitFollowsClaudeSemantics(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		provider string
-		detail   Detail
-		want     Breakdown
+		name   string
+		detail Detail
+		want   Breakdown
 	}{
-		{"claude reasoning inside output", "claude",
+		{"claude reasoning inside output",
 			Detail{InputTokens: 100, OutputTokens: 50, ReasoningTokens: 20, CacheReadTokens: 30, CacheCreationTokens: 10},
 			Breakdown{Quality: QualityComplete, Uncached: 100, CacheRead: 30, CacheWrite: 10, Output: 50, Reasoning: 20, Total: 190}},
-		{"claude total adds reasoning", "claude",
+		{"claude total adds reasoning",
 			Detail{InputTokens: 100, OutputTokens: 50, ReasoningTokens: 20, TotalTokens: 170},
 			Breakdown{Quality: QualityComplete, Uncached: 100, Output: 70, Reasoning: 20, Total: 170}},
-		{"claude total contradicts parts", "claude", Detail{InputTokens: 100, OutputTokens: 50, TotalTokens: 400},
+		{"claude total contradicts parts", Detail{InputTokens: 100, OutputTokens: 50, TotalTokens: 400},
 			Breakdown{Quality: QualityInconsistent, Total: 400}},
-		{"codex cache inside input", "codex",
-			Detail{InputTokens: 128, OutputTokens: 8, ReasoningTokens: 3, CacheReadTokens: 32, TotalTokens: 136},
-			Breakdown{Quality: QualityComplete, Uncached: 96, CacheRead: 32, Output: 8, Reasoning: 3, Total: 136}},
-		{"codex cache beyond input", "codex", Detail{InputTokens: 10, OutputTokens: 8, CacheReadTokens: 32},
-			Breakdown{Quality: QualityInconsistent, Total: 18}},
-		{"codex total only", "codex", Detail{TotalTokens: 99}, Breakdown{Quality: QualityUnclassified, Total: 99}},
-		{"codex parts without parents", "codex", Detail{CachedTokens: 40, ReasoningTokens: 5}, Breakdown{Quality: QualityUnclassified, Total: 45}},
-		{"nothing reported", "claude", Detail{}, Breakdown{}},
+		{"nothing reported", Detail{}, Breakdown{}},
 	} {
-		if got := Split(test.provider, test.detail); got != test.want {
+		if got := Split(test.detail); got != test.want {
 			t.Errorf("%s: %+v, want %+v", test.name, got, test.want)
 		}
 	}
@@ -130,10 +122,10 @@ func TestSplitFollowsProviderSemantics(t *testing.T) {
 
 func TestCost(t *testing.T) {
 	rates := Rates{Input: 5, Output: 25, CacheRead: 0.5, CacheWrite: 6.25}
-	breakdown := Split("claude", Detail{InputTokens: 1000, OutputTokens: 2000, ReasoningTokens: 500, CacheReadTokens: 10000, CacheCreationTokens: 4000})
+	breakdown := Split(Detail{InputTokens: 1000, OutputTokens: 2000, ReasoningTokens: 500, CacheReadTokens: 10000, CacheCreationTokens: 4000})
 	// Reasoning is part of Claude's output and is charged once.
 	near(t, "cost", Cost(rates, breakdown), (1000*5+2000*25+10000*0.5+4000*6.25)/1e6)
-	if Cost(rates, Split("codex", Detail{TotalTokens: 5000})) != 0 {
-		t.Fatal("unclassified usage was priced")
+	if Cost(rates, Split(Detail{InputTokens: 100, OutputTokens: 50, TotalTokens: 400})) != 0 {
+		t.Fatal("inconsistent usage was priced")
 	}
 }

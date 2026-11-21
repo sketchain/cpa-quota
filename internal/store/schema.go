@@ -29,7 +29,6 @@ var migrations = []string{
 		id                 bigserial PRIMARY KEY,
 		instance           text             NOT NULL,
 		auth_index         text             NOT NULL,
-		provider           text             NOT NULL,
 		request_id         text             NOT NULL DEFAULT '',
 		requested_ns       bigint           NOT NULL,
 		latency_ms         bigint           NOT NULL DEFAULT 0,
@@ -48,7 +47,6 @@ var migrations = []string{
 		accounting         text             NOT NULL DEFAULT '',
 		cost_usd           double precision NOT NULL DEFAULT 0,
 		priced             boolean          NOT NULL DEFAULT false,
-		main_window        boolean          NOT NULL DEFAULT false,
 		failed             boolean          NOT NULL DEFAULT false,
 		status_code        integer          NOT NULL DEFAULT 0
 	);
@@ -56,17 +54,12 @@ var migrations = []string{
 	CREATE INDEX requests_account_time ON requests (instance, auth_index, requested_ns);
 
 	CREATE TABLE quota_reports (
-		id                bigserial PRIMARY KEY,
-		instance          text    NOT NULL,
-		auth_index        text    NOT NULL,
-		provider          text    NOT NULL,
-		request_id        text    NOT NULL DEFAULT '',
-		at_ns             bigint  NOT NULL,
-		at                ` + generatedAt("at_ns") + `,
-		plan              text    NOT NULL DEFAULT '',
-		credit_balance    double precision,
-		credits_unlimited boolean,
-		limit_reached     boolean NOT NULL DEFAULT false
+		id         bigserial PRIMARY KEY,
+		instance   text   NOT NULL,
+		auth_index text   NOT NULL,
+		request_id text   NOT NULL DEFAULT '',
+		at_ns      bigint NOT NULL,
+		at         ` + generatedAt("at_ns") + `
 	);
 	CREATE UNIQUE INDEX quota_reports_request_id ON quota_reports (instance, request_id) WHERE request_id <> '';
 	CREATE INDEX quota_reports_account_time ON quota_reports (instance, auth_index, at_ns);
@@ -75,7 +68,6 @@ var migrations = []string{
 		report_id    bigint           NOT NULL REFERENCES quota_reports (id) ON DELETE CASCADE,
 		instance     text             NOT NULL,
 		auth_index   text             NOT NULL,
-		provider     text             NOT NULL,
 		limit_key    text             NOT NULL,
 		seconds      bigint           NOT NULL,
 		at_ns        bigint           NOT NULL,
@@ -85,7 +77,7 @@ var migrations = []string{
 		reset_at     ` + generatedAt("reset_ns") + `,
 		PRIMARY KEY (report_id, limit_key, seconds)
 	);
-	CREATE INDEX quota_report_windows_lookup ON quota_report_windows (instance, auth_index, provider, limit_key, seconds, at_ns);
+	CREATE INDEX quota_report_windows_lookup ON quota_report_windows (instance, auth_index, limit_key, seconds, at_ns);
 
 	CREATE TABLE streams (
 		instance   text        NOT NULL,
@@ -139,12 +131,8 @@ var migrations = []string{
 	CREATE TABLE estimates (
 		instance                text             NOT NULL,
 		auth_index              text             NOT NULL,
-		provider                text             NOT NULL,
-		subscription            text             NOT NULL,
 		tier                    text             NOT NULL,
 		state                   text             NOT NULL,
-		pause_reason            text             NOT NULL DEFAULT '',
-		segment_window          text             NOT NULL,
 		basis                   text             NOT NULL,
 		k                       double precision,
 		k_source                text             NOT NULL,
@@ -185,15 +173,13 @@ var migrations = []string{
 	);
 
 	CREATE TABLE model_weights (
-		instance   text        NOT NULL,
-		provider   text        NOT NULL,
+		instance   text        PRIMARY KEY,
 		enabled    boolean     NOT NULL,
 		basis      text        NOT NULL,
 		effective  jsonb       NOT NULL,
 		estimate   jsonb       NOT NULL,
 		models     jsonb       NOT NULL,
-		updated_at timestamptz NOT NULL DEFAULT now(),
-		PRIMARY KEY (instance, provider)
+		updated_at timestamptz NOT NULL DEFAULT now()
 	);
 
 	CREATE TABLE calibrations (
@@ -223,7 +209,6 @@ var migrations = []string{
 		at_ns       bigint  NOT NULL,
 		at          ` + generatedAt("at_ns") + `,
 		auth_index  text    NOT NULL DEFAULT '',
-		provider    text    NOT NULL DEFAULT '',
 		model       text    NOT NULL DEFAULT '',
 		category    text    NOT NULL DEFAULT '',
 		reason      text    NOT NULL DEFAULT '',
