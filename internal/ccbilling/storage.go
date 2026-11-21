@@ -100,12 +100,6 @@ func commitAdvance(ctx context.Context, db *sql.DB, instance, authIndex string, 
 		return err
 	}
 	return transact(ctx, db, func(tx *sql.Tx) error {
-		if state.restarted {
-			// The stored segments measure another window.
-			if _, err := tx.ExecContext(ctx, `DELETE FROM segments WHERE instance = $1 AND auth_index = $2`, instance, authIndex); err != nil {
-				return fmt.Errorf("Reset segments: %w", err)
-			}
-		}
 		for _, segment := range segments {
 			var models any
 			if len(segment.Models) > 0 {
@@ -183,11 +177,11 @@ func resetStreams(ctx context.Context, db *sql.DB, instance string) error {
 	})
 }
 
-// knownAccounts lists the accounts of a provider the instance has requests
-// or quota reports of.
-func knownAccounts(ctx context.Context, db *sql.DB, instance, provider string) ([]string, error) {
-	rows, err := db.QueryContext(ctx, `SELECT auth_index FROM requests WHERE instance = $1 AND provider = $2
-		UNION SELECT auth_index FROM quota_reports WHERE instance = $1 AND provider = $2`, instance, provider)
+// knownAccounts lists the accounts the instance has requests or quota
+// reports of.
+func knownAccounts(ctx context.Context, db *sql.DB, instance string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT auth_index FROM requests WHERE instance = $1
+		UNION SELECT auth_index FROM quota_reports WHERE instance = $1`, instance)
 	if err != nil {
 		return nil, fmt.Errorf("Read accounts: %w", err)
 	}
@@ -204,10 +198,10 @@ func knownAccounts(ctx context.Context, db *sql.DB, instance, provider string) (
 }
 
 // firstReport is the time of an account's earliest main window report.
-func firstReport(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string) (time.Time, bool, error) {
+func firstReport(ctx context.Context, db *sql.DB, instance, authIndex string) (time.Time, bool, error) {
 	var first sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT min(at_ns) FROM quota_report_windows WHERE instance = $1 AND auth_index = $2 AND provider = $3`,
-		instance, authIndex, source.Provider).Scan(&first); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT min(at_ns) FROM quota_report_windows WHERE instance = $1 AND auth_index = $2`,
+		instance, authIndex).Scan(&first); err != nil {
 		return time.Time{}, false, fmt.Errorf("Read quota reports: %w", err)
 	}
 	if !first.Valid {
@@ -217,15 +211,14 @@ func firstReport(ctx context.Context, db *sql.DB, instance string, source QuotaS
 }
 
 // readObservations returns an account's main window reports made after from
-// and no later than to, one per request, oldest first, with the credit
-// balance each report named.
-func readObservations(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string, from, to time.Time) ([]Observation, error) {
-	rows, err := db.QueryContext(ctx, `SELECT w.report_id, w.at_ns, w.seconds, w.used_percent, w.reset_ns, r.credit_balance
-		FROM quota_report_windows w JOIN quota_reports r ON r.id = w.report_id
-		WHERE w.instance = $1 AND w.auth_index = $2 AND w.provider = $3 AND w.limit_key = $4 AND w.seconds IN ($5, $6)
-		AND w.at_ns > $7 AND w.at_ns <= $8
-		ORDER BY w.at_ns, w.report_id`,
-		instance, authIndex, source.Provider, source.LimitKey, int64(FiveHours/time.Second), int64(Week/time.Second), nanos(from), nanos(to))
+// and no later than to, one per request, oldest first.
+func readObservations(ctx context.Context, db *sql.DB, instance, authIndex string, from, to time.Time) ([]Observation, error) {
+	rows, err := db.QueryContext(ctx, `SELECT report_id, at_ns, seconds, used_percent, reset_ns
+		FROM quota_report_windows
+		WHERE instance = $1 AND auth_index = $2 AND limit_key = $3 AND seconds IN ($4, $5)
+		AND at_ns > $6 AND at_ns <= $7
+		ORDER BY at_ns, report_id`,
+		instance, authIndex, mainLimitKey, int64(FiveHours/time.Second), int64(Week/time.Second), nanos(from), nanos(to))
 	if err != nil {
 		return nil, fmt.Errorf("Read quota reports: %w", err)
 	}
@@ -235,16 +228,12 @@ func readObservations(ctx context.Context, db *sql.DB, instance string, source Q
 	for rows.Next() {
 		var id, at, seconds, resetAt int64
 		var used float64
-		var credits sql.NullFloat64
-		if err := rows.Scan(&id, &at, &seconds, &used, &resetAt, &credits); err != nil {
+		if err := rows.Scan(&id, &at, &seconds, &used, &resetAt); err != nil {
 			return nil, fmt.Errorf("Read quota reports: %w", err)
 		}
 		if id != lastID || len(observations) == 0 {
 			observations = append(observations, Observation{At: timeAt(at)})
 			lastID = id
-			if credits.Valid && finite(credits.Float64) {
-				observations[len(observations)-1].HasCredits, observations[len(observations)-1].Credits = true, credits.Float64
-			}
 		}
 		obs := &observations[len(observations)-1]
 		if seconds == int64(FiveHours/time.Second) {
@@ -262,9 +251,9 @@ const maxRequestDuration = 2 * time.Hour
 // readCosts returns the costs, in USD, of an account's requests completed
 // after from and no later than to. Requests whose cost stays out of the
 // segments are marked with the reason; each request is judged by its own
-// record and quota report only.
-func readCosts(ctx context.Context, db *sql.DB, instance string, rules SegmentRules, authIndex string, from, to time.Time) ([]CostEvent, error) {
-	rows, err := db.QueryContext(ctx, `SELECT requested_ns, completed_ns, cost_usd, model, priced, main_window, accounting
+// record only.
+func readCosts(ctx context.Context, db *sql.DB, instance, authIndex string, from, to time.Time) ([]CostEvent, error) {
+	rows, err := db.QueryContext(ctx, `SELECT requested_ns, completed_ns, cost_usd, model, priced, accounting
 		FROM requests
 		WHERE instance = $1 AND auth_index = $2 AND requested_ns > $3 AND requested_ns <= $4 AND completed_ns > $5 AND completed_ns <= $4
 		ORDER BY requested_ns, id`, instance, authIndex, nanos(from.Add(-maxRequestDuration)), nanos(to), nanos(from))
@@ -277,17 +266,12 @@ func readCosts(ctx context.Context, db *sql.DB, instance string, rules SegmentRu
 		var at, completed int64
 		var cost float64
 		var model, accounting string
-		var priced, mainWindow bool
-		if err := rows.Scan(&at, &completed, &cost, &model, &priced, &mainWindow, &accounting); err != nil {
+		var priced bool
+		if err := rows.Scan(&at, &completed, &cost, &model, &priced, &accounting); err != nil {
 			return nil, fmt.Errorf("Read request costs: %w", err)
 		}
 		event := CostEvent{At: timeAt(completed), USD: cost, Model: NormalizeModel(model)}
-		switch {
-		case rules.MainWindowOnly && !mainWindow:
-			// Another pool's request leaves only its own cost out, priced
-			// or not.
-			event.Excluded = ExcludedOtherLimit
-		case !costKnown(priced, accounting):
+		if !costKnown(priced, accounting) {
 			event.Excluded, event.Unpriced = ExcludedUnpriced, !priced
 		}
 		costs = append(costs, event)

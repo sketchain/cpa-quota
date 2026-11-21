@@ -17,7 +17,6 @@ const (
 // AccountStatus is one account's estimate and current capacity.
 type AccountStatus struct {
 	AuthIndex string `json:"auth_index"`
-	Provider  string `json:"provider"`
 	Tier      string `json:"tier"`
 	Estimate
 	KAuto      *float64  `json:"k_auto,omitempty"`
@@ -44,33 +43,19 @@ type AccountStatus struct {
 	// RemainingWeek and RemainingFiveHour are R_week and R_5h after the safety factor.
 	RemainingWeek     float64 `json:"remaining_week_usd"`
 	RemainingFiveHour float64 `json:"remaining_five_hour_usd"`
-	// Paused reports that the account's estimate stopped updating, and why.
-	Paused      bool      `json:"paused"`
-	PauseReason string    `json:"pause_reason,omitempty"`
-	PausedSince time.Time `json:"paused_since,omitzero"`
 }
 
-// Segment windows.
-const (
-	WindowFiveHour = "5h"
-	WindowWeek     = "7d"
-)
-
 // ResolveAccount combines an account's estimate, k evidence and latest report.
-// params are the parameters of the account's provider.
 //
 // Segments of the 5-hour window give its total; k turns it into the weekly
 // total. Without any k the weekly total is the tier's default and 5-hour
-// reservations are off. Segments of the 7-day window, for accounts whose
-// reports have no 5-hour window, give the weekly total directly, without k,
-// and such accounts have no 5-hour reservation.
+// reservations are off.
 func ResolveAccount(authIndex string, settings AccountSettings, estimate Estimate, k KEstimate, latest Observation, params Params, now time.Time) AccountStatus {
 	status := AccountStatus{AuthIndex: authIndex, Tier: settings.Tier, Estimate: estimate, KManual: settings.ManualK,
 		KEstimate: k, KSource: SourceNone, ObservedAt: latest.At}
 	if status.Tier == "" {
 		status.Tier = params.fallbackTier()
 	}
-	weekly := estimate.Window == WindowWeek
 	status.KAuto = k.K
 	switch {
 	case settings.ManualK != nil:
@@ -89,12 +74,9 @@ func ResolveAccount(authIndex string, settings AccountSettings, estimate Estimat
 	case status.ColdStart:
 		status.TotalsFrom = SourceTier
 		status.WeeklyTotal = params.TierWeekly(status.Tier)
-		if status.K != nil && !weekly {
+		if status.K != nil {
 			status.FiveHourTotal = status.WeeklyTotal / *status.K
 		}
-	case weekly:
-		status.TotalsFrom = SourceEstimated
-		status.WeeklyTotal = estimate.FiveHourUSD
 	case status.K != nil:
 		status.TotalsFrom = SourceEstimated
 		status.FiveHourTotal = estimate.FiveHourUSD
@@ -105,7 +87,7 @@ func ResolveAccount(authIndex string, settings AccountSettings, estimate Estimat
 		status.FiveHourTotal = estimate.FiveHourUSD
 		status.WeeklyTotal = params.TierWeekly(status.Tier)
 	}
-	status.NeedsK = status.K == nil && !weekly
+	status.NeedsK = status.K == nil
 	if latest.Has5h && latest.Reset5h.After(now) {
 		status.Used5h, status.Reset5h = latest.Used5h, latest.Reset5h
 	} else if latest.Has5h && latest.Reset5h.IsZero() {

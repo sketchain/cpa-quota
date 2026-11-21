@@ -34,20 +34,18 @@ type Config struct {
 	PriceRetryMinutes   float64 `yaml:"price_retry_minutes"`
 	PriceTimeoutSeconds float64 `yaml:"price_timeout_seconds"`
 
-	// Subscription is claude or chatgpt; Tier one of its tiers.
-	Subscription string   `yaml:"subscription"`
+	// Tier is the Claude subscription tier: pro, max5x or max20x.
 	Tier         string   `yaml:"tier"`
 	ManualK      *float64 `yaml:"manual_k"`
 	SafetyFactor float64  `yaml:"safety_factor"`
-	// TierWeeklyUSD and TierK override the subscription's tier defaults.
+	// TierWeeklyUSD and TierK override the tier defaults.
 	TierWeeklyUSD map[string]float64 `yaml:"tier_weekly_usd"`
 	TierK         map[string]float64 `yaml:"tier_k"`
 	// AuthIndexes, when set, are the only accounts tracked; they are
 	// tracked from the start, before any usage.
 	AuthIndexes []string `yaml:"auth_indexes"`
 	// AccountAuthTypes are the credential types whose usage counts.
-	AccountAuthTypes     []string `yaml:"account_auth_types"`
-	CodexFastModeBilling bool     `yaml:"codex_fast_mode_billing"`
+	AccountAuthTypes []string `yaml:"account_auth_types"`
 
 	DBTimeoutSeconds        float64 `yaml:"db_timeout_seconds"`
 	DBRetrySeconds          float64 `yaml:"db_retry_seconds"`
@@ -102,7 +100,7 @@ func DefaultConfig() Config {
 	params := ccbilling.DefaultParams()
 	weights := ccbilling.DefaultWeightSettings()
 	return Config{PostgresSchema: "cpa_quota", PriceURL: DefaultPriceURL, PriceRefreshHours: 24, PriceRetryMinutes: 5, PriceTimeoutSeconds: 5,
-		Subscription: ccbilling.SubscriptionClaude, SafetyFactor: params.SafetyFactor, AccountAuthTypes: []string{"oauth"},
+		SafetyFactor: params.SafetyFactor, AccountAuthTypes: []string{"oauth"},
 		DBTimeoutSeconds: 3, DBRetrySeconds: 60, RefreshIntervalSeconds: 60, ProcessBudgetSeconds: 3, RebuildBudgetSeconds: 20,
 		TrendTimezone: "UTC", ForecastWindow5hMinutes: 60, ForecastWindow7dHours: 24,
 		Estimation: EstimationConfig{SegmentRetentionDays: params.SegmentRetentionDays, BlockGapMinutes: params.BlockGapMinutes,
@@ -120,7 +118,6 @@ func ParseConfig(raw []byte) (Config, error) {
 	}
 	config.Instance = strings.TrimSpace(config.Instance)
 	config.PostgresDSN = strings.TrimSpace(config.PostgresDSN)
-	config.Subscription = strings.ToLower(strings.TrimSpace(config.Subscription))
 	config.Tier = strings.ToLower(strings.TrimSpace(config.Tier))
 	switch {
 	case config.Instance == "":
@@ -129,8 +126,6 @@ func ParseConfig(raw []byte) (Config, error) {
 		return Config{}, errors.New("cpa-quota: instance must not exceed 128 bytes")
 	case config.PostgresDSN == "":
 		return Config{}, errors.New("cpa-quota: postgres_dsn is required")
-	case ccbilling.ProviderOf(config.Subscription) == "":
-		return Config{}, fmt.Errorf("cpa-quota: subscription must be claude or chatgpt, not %q", config.Subscription)
 	case strings.TrimSpace(config.PostgresSchema) == "":
 		return Config{}, errors.New("cpa-quota: postgres_schema must not be empty")
 	}
@@ -181,12 +176,9 @@ func ParseConfig(raw []byte) (Config, error) {
 	return config, nil
 }
 
-// Provider is the provider of the subscription's accounts.
-func (c Config) Provider() string { return ccbilling.ProviderOf(c.Subscription) }
-
 // Account is the settings of every tracked account.
 func (c Config) Account() ccbilling.AccountSettings {
-	return ccbilling.AccountSettings{Provider: c.Provider(), Tier: c.Tier, ManualK: c.ManualK}
+	return ccbilling.AccountSettings{Tier: c.Tier, ManualK: c.ManualK}
 }
 
 // Settings turns the configuration into estimation settings, with the
@@ -198,37 +190,35 @@ func (c Config) Settings() (ccbilling.Settings, error) {
 	settings.Params.ReferenceMode, settings.Params.SuspiciousThreshold, settings.Params.ExcludeVoteShare = e.ReferenceMode, e.SuspiciousThreshold, e.ExcludeVoteShare
 	settings.Params.WeightPower, settings.Params.RecentDays, settings.Params.RecentShare = e.WeightPower, e.RecentDays, e.RecentShare
 	settings.Params.KMinWeeklyPoints, settings.Params.ColdStartBlocks, settings.Params.SafetyFactor = e.KMinWeeklyPoints, e.ColdStartBlocks, c.SafetyFactor
-	provider := c.Provider()
-	profile := settings.Providers[provider]
-	profile.Tiers = slices.Clone(profile.Tiers)
+	tiers := slices.Clone(settings.Tiers)
 	known := map[string]bool{}
-	for i, tier := range profile.Tiers {
+	for i, tier := range tiers {
 		known[tier.ID] = true
 		if value, ok := c.TierWeeklyUSD[tier.ID]; ok {
-			profile.Tiers[i].WeeklyUSD = value
+			tiers[i].WeeklyUSD = value
 		}
 		if value, ok := c.TierK[tier.ID]; ok {
 			k := value
-			profile.Tiers[i].K = &k
+			tiers[i].K = &k
 		}
 	}
 	for _, overrides := range []map[string]float64{c.TierWeeklyUSD, c.TierK} {
 		for id := range overrides {
 			if !known[id] {
-				return ccbilling.Settings{}, fmt.Errorf("%q is not a tier of %s subscriptions", id, c.Subscription)
+				return ccbilling.Settings{}, fmt.Errorf("%q is not a Claude subscription tier", id)
 			}
 		}
 	}
 	if c.Tier != "" && !known[c.Tier] {
-		return ccbilling.Settings{}, fmt.Errorf("tier %q is not a tier of %s subscriptions", c.Tier, c.Subscription)
+		return ccbilling.Settings{}, fmt.Errorf("tier %q is not a Claude subscription tier", c.Tier)
 	}
+	settings.Tiers = tiers
 	weights := ccbilling.WeightSettings{Enabled: c.ModelWeights.Enabled, Items: []ccbilling.WeightItem{}, MinSegments: c.ModelWeights.MinSegments,
 		MinCostUSD: c.ModelWeights.MinCostUSD, MinShareSpread: c.ModelWeights.MinShareSpread}
 	for _, item := range c.ModelWeights.Items {
 		weights.Items = append(weights.Items, ccbilling.WeightItem{ID: item.ID, Name: item.Name, Models: item.Models, Manual: item.ManualMultiplier})
 	}
-	profile.Weights = weights
-	settings.Providers[provider] = profile
+	settings.Weights = weights
 	for _, index := range c.AuthIndexes {
 		settings.Accounts[index] = c.Account()
 	}
@@ -257,8 +247,7 @@ func configFields() []configField {
 		{Name: "admin_token", Type: "string", Description: "Bearer token of the admin operations; empty disables them."},
 		{Name: "price_url", Type: "string", Default: defaults.PriceURL, Description: "new-api ratio table the prices come from."},
 		{Name: "price_refresh_hours", Type: "number", Default: defaults.PriceRefreshHours, Description: "Age after which usage handling refreshes the ratio table."},
-		{Name: "subscription", Type: "enum", Default: defaults.Subscription, EnumValues: []string{"claude", "chatgpt"}, Description: "Subscription of the instance's account."},
-		{Name: "tier", Type: "enum", EnumValues: []string{"pro", "max5x", "max20x", "team"}, Description: "Subscription tier; default the subscription's first."},
+		{Name: "tier", Type: "enum", EnumValues: []string{"pro", "max5x", "max20x"}, Description: "Claude subscription tier; default pro."},
 		{Name: "manual_k", Type: "number", Description: "Weekly/5-hour ratio overriding the estimated one."},
 		{Name: "safety_factor", Type: "number", Default: defaults.SafetyFactor, Description: "Discount of the remaining capacity."},
 		{Name: "estimation", Type: "object", Description: "Estimation parameters."},

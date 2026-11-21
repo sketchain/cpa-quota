@@ -17,34 +17,37 @@ import (
 // here is synchronous and every network operation has a short timeout, so a
 // slow database or price server delays the queue by at most those timeouts.
 //
-// It records a request and its quota report for a tracked account, and a
-// safeguard event for a Claude policy refusal; then it refreshes the ratio
-// table when due and the estimates when their interval has passed.
+// Only Claude records count: records of any other provider are ignored. It
+// records a request and its quota report for a tracked account, and a
+// safeguard event for a policy refusal; then it refreshes the ratio table
+// when due and the estimates when their interval has passed.
 func (a *App) HandleUsage(record UsageRecord) {
 	config, db, manager, prices, running := a.state()
 	if !running || db == nil || manager == nil {
 		return
 	}
-	provider := trimLower(record.Provider)
+	if trimLower(record.Provider) != ccbilling.ProviderClaude {
+		return
+	}
 	authIndex := strings.TrimSpace(record.AuthIndex)
 	at := record.RequestedAt
 	if at.IsZero() {
 		at = a.Now()
 	}
 	var writes []store.Write
-	if refusal, ok := safeguard.Detect(record.Failed, record.Failure.Body); ok && provider == ccbilling.ProviderClaude {
-		writes = append(writes, store.SafeguardWrite(store.SafeguardEvent{Instance: config.Instance, At: at, AuthIndex: authIndex, Provider: provider,
+	if refusal, ok := safeguard.Detect(record.Failed, record.Failure.Body); ok {
+		writes = append(writes, store.SafeguardWrite(store.SafeguardEvent{Instance: config.Instance, At: at, AuthIndex: authIndex,
 			Model: pricing.BillingModel(record.Model, record.Alias), Category: refusal.Category, Reason: refusal.Reason,
 			RequestID: strings.TrimSpace(record.RequestID), StatusCode: record.Failure.StatusCode, Stream: record.Stream}))
 	}
-	if a.counts(config, provider, authIndex, record.AuthType) {
+	if a.counts(config, authIndex, record.AuthType) {
 		// A refresh running meanwhile cannot add the account; the next one
 		// finds it in the database.
 		manager.Track(authIndex)
 		a.maybeRefreshPrices()
-		request, report := buildFacts(config, record, provider, authIndex, at, prices.current())
+		request, report := buildFacts(config, record, authIndex, at, prices.current())
 		writes = append(writes, store.RecordWrite(&request, report))
-		if obs, ok := observation(report, quotaheaders.MainLimit(provider), at); ok {
+		if obs, ok := observation(report, at); ok {
 			manager.Observe(authIndex, obs)
 		}
 	}
@@ -56,43 +59,36 @@ func (a *App) HandleUsage(record UsageRecord) {
 	manager.MaybeRefresh()
 }
 
-// counts reports whether a record belongs to the instance's subscription
-// accounts: the configured provider, a configured credential type and an
-// auth index, one of auth_indexes when they are configured.
-func (a *App) counts(config Config, provider, authIndex, authType string) bool {
-	return authIndex != "" && provider == config.Provider() && slices.Contains(config.AccountAuthTypes, trimLower(authType)) &&
+// counts reports whether a Claude record belongs to the instance's
+// subscription accounts: a configured credential type and an auth index, one
+// of auth_indexes when they are configured.
+func (a *App) counts(config Config, authIndex, authType string) bool {
+	return authIndex != "" && slices.Contains(config.AccountAuthTypes, trimLower(authType)) &&
 		(len(config.AuthIndexes) == 0 || slices.Contains(config.AuthIndexes, authIndex))
 }
 
 // buildFacts prices a record and reads its quota headers.
-func buildFacts(config Config, record UsageRecord, provider, authIndex string, at time.Time, table *pricing.Table) (store.Request, *store.QuotaReport) {
+func buildFacts(config Config, record UsageRecord, authIndex string, at time.Time, table *pricing.Table) (store.Request, *store.QuotaReport) {
 	detail := record.Detail
-	breakdown := pricing.Split(provider, pricing.Detail{InputTokens: detail.InputTokens, OutputTokens: detail.OutputTokens,
+	breakdown := pricing.Split(pricing.Detail{InputTokens: detail.InputTokens, OutputTokens: detail.OutputTokens,
 		ReasoningTokens: detail.ReasoningTokens, CachedTokens: detail.CachedTokens, CacheReadTokens: detail.CacheReadTokens,
 		CacheCreationTokens: detail.CacheCreationTokens, TotalTokens: detail.TotalTokens})
 	rates, priced := table.Lookup(record.Model, record.Alias)
 	cost := 0.0
 	if priced {
 		cost = pricing.Cost(rates, breakdown)
-		// Fast mode bills the service tier the client asked for, which is
-		// known when the request is priced.
-		if config.CodexFastModeBilling && provider == ccbilling.ProviderCodex && breakdown.Billable() &&
-			strings.EqualFold(strings.TrimSpace(record.ServiceTier), "priority") {
-			cost *= pricing.FastModeMultiplier
-		}
 	}
-	headers := quotaheaders.Parse(provider, record.ResponseHeaders, at)
-	request := store.Request{Instance: config.Instance, AuthIndex: authIndex, Provider: provider, RequestID: strings.TrimSpace(record.RequestID),
+	headers := quotaheaders.Parse(record.ResponseHeaders)
+	request := store.Request{Instance: config.Instance, AuthIndex: authIndex, RequestID: strings.TrimSpace(record.RequestID),
 		RequestedAt: at, Latency: record.Latency, Model: pricing.BillingModel(record.Model, record.Alias),
 		UpstreamModel: pricing.WithoutOptions(record.Model), ServiceTier: strings.TrimSpace(record.ServiceTier), Stream: record.Stream,
 		InputTokens: breakdown.Uncached, CacheReadTokens: breakdown.CacheRead, CacheWriteTokens: breakdown.CacheWrite, OutputTokens: breakdown.Output,
 		ReasoningTokens: breakdown.Reasoning, TotalTokens: breakdown.Total, Accounting: breakdown.Quality, CostUSD: cost, Priced: priced,
-		MainWindow: headers.HasMainWindow(), Failed: record.Failed, StatusCode: record.Failure.StatusCode}
+		Failed: record.Failed, StatusCode: record.Failure.StatusCode}
 	if headers == nil {
 		return request, nil
 	}
-	report := &store.QuotaReport{Instance: config.Instance, AuthIndex: authIndex, Provider: provider, RequestID: request.RequestID, At: at,
-		Plan: headers.Plan, CreditBalance: headers.CreditBalance, CreditsUnlimited: headers.CreditsUnlimited, LimitReached: headers.LimitReached}
+	report := &store.QuotaReport{Instance: config.Instance, AuthIndex: authIndex, RequestID: request.RequestID, At: at}
 	for _, window := range headers.Windows {
 		report.Windows = append(report.Windows, store.ReportWindow{LimitKey: window.LimitKey, Seconds: window.Seconds,
 			UsedPercent: window.UsedPercent, ResetAt: window.ResetAt})
@@ -102,16 +98,13 @@ func buildFacts(config Config, record UsageRecord, provider, authIndex string, a
 
 // observation is what a report says about the main windows, for the live
 // state; false when it names none.
-func observation(report *store.QuotaReport, limit string, at time.Time) (ccbilling.Observation, bool) {
+func observation(report *store.QuotaReport, at time.Time) (ccbilling.Observation, bool) {
 	if report == nil {
 		return ccbilling.Observation{}, false
 	}
 	obs := ccbilling.Observation{At: at}
-	if report.CreditBalance != nil {
-		obs.HasCredits, obs.Credits = true, *report.CreditBalance
-	}
 	for _, window := range report.Windows {
-		if window.LimitKey != limit {
+		if window.LimitKey != quotaheaders.LimitClaudeUnified {
 			continue
 		}
 		switch window.Seconds {
@@ -121,6 +114,5 @@ func observation(report *store.QuotaReport, limit string, at time.Time) (ccbilli
 			obs.Has7d, obs.Used7d, obs.Reset7d = true, window.UsedPercent, window.ResetAt
 		}
 	}
-	obs.LimitReached = report.LimitReached && (obs.Has5h || obs.Has7d)
 	return obs, obs.Has5h || obs.Has7d
 }

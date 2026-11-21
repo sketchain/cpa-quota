@@ -3,7 +3,6 @@ package ccbilling
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -41,12 +40,8 @@ type accountSnapshot struct {
 	k        KEstimate
 	cursor   time.Time
 	kCursor  time.Time
-	// window, pause and excluded come from the account's stream.
-	window      string
-	paused      bool
-	pauseReason string
-	pausedSince time.Time
-	excluded    ExcludedCost
+	// excluded comes from the account's stream.
+	excluded ExcludedCost
 	// forecast is the consumption forecast as of the snapshot.
 	forecast AccountForecast
 	// trend is the account's daily k evidence and segments.
@@ -58,8 +53,7 @@ type snapshot struct {
 	at       time.Time
 	settings Settings
 	accounts map[string]accountSnapshot
-	// weights is each provider's quota weights.
-	weights map[string]weightsSnapshot
+	weights  weightsSnapshot
 }
 
 // Manager keeps the estimates of every tracked account of one instance.
@@ -86,9 +80,9 @@ type Manager struct {
 	discovered  bool
 	lastRefresh time.Time
 	lastPrune   time.Time
-	// weightCache holds each provider's last weight estimate and the inputs
-	// it used.
-	weightCache map[string]weightCache
+	// weightCache holds the last weight estimate and the inputs it used;
+	// nil when there is none.
+	weightCache *weightCache
 	persisted   persistedState
 
 	snap atomic.Pointer[snapshot]
@@ -136,27 +130,18 @@ func (m *Manager) Loaded() bool { return m.snap.Load() != nil }
 func (m *Manager) Settings() Settings { return *m.loaded.Load() }
 
 // Configure applies new settings. template is the settings of every account
-// the manager tracks: its provider decides which accounts those are. A
-// non-empty allowed limits tracking to those auth indexes. Accounts already
-// tracked keep being tracked when they still qualify.
+// the manager tracks. A non-empty allowed limits tracking to those auth
+// indexes. Accounts already tracked keep being tracked when they still
+// qualify.
 func (m *Manager) Configure(settings Settings, template AccountSettings, allowed []string) (Settings, error) {
-	template.Provider = strings.TrimSpace(template.Provider)
-	if template.Provider == "" {
-		template.Provider = ProviderClaude
-	}
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
-	changedProvider := m.template.Provider != "" && m.template.Provider != template.Provider
 	accounts := map[string]AccountSettings{}
 	for index := range settings.Accounts {
 		accounts[index] = template
 	}
-	if !changedProvider {
-		// Accounts of another provider read other reports, so only the
-		// same provider's stay tracked.
-		for index := range m.settings.Accounts {
-			accounts[index] = template
-		}
+	for index := range m.settings.Accounts {
+		accounts[index] = template
 	}
 	settings.Accounts = map[string]AccountSettings{}
 	for index, account := range accounts {
@@ -170,27 +155,13 @@ func (m *Manager) Configure(settings Settings, template AccountSettings, allowed
 	}
 	m.settings, m.template, m.allowed = normalized, template, slices.Clone(allowed)
 	m.loaded.Store(&normalized)
-	if changedProvider {
-		m.accounts = map[string]*accountCache{}
-		m.discovered = false
-	}
 	m.weightCache = nil
 	m.snap.Store(nil)
 	m.lastRefresh = time.Time{}
 	return normalized, nil
 }
 
-// Provider is the provider of the tracked accounts.
-func (m *Manager) Provider() string {
-	m.refreshMu.Lock()
-	defer m.refreshMu.Unlock()
-	if m.template.Provider == "" {
-		return ProviderClaude
-	}
-	return m.template.Provider
-}
-
-// Track starts tracking an account of the configured provider and reports
+// Track starts tracking an account and reports
 // whether it is tracked. It never waits for a running refresh: an account
 // it cannot add now is added by the next refresh, which reads the accounts
 // the database has records of.
@@ -319,12 +290,6 @@ func mergeLatest(current, next Observation) Observation {
 		}
 	}
 	newer := next.At.After(current.At)
-	if newer || current.At.IsZero() {
-		current.LimitReached = next.LimitReached
-		if next.HasCredits {
-			current.HasCredits, current.Credits = true, next.Credits
-		}
-	}
 	merge(&current.Has5h, &current.Used5h, &current.Reset5h, next.Has5h, next.Used5h, next.Reset5h, newer)
 	merge(&current.Has7d, &current.Used7d, &current.Reset7d, next.Has7d, next.Used7d, next.Reset7d, newer)
 	if newer {
@@ -362,14 +327,14 @@ func (m *Manager) withDB(timeout time.Duration, fn func(ctx context.Context, db 
 func (m *Manager) refreshLocked() error {
 	now := m.host.Now()
 	accounts := map[string]accountSnapshot{}
-	var weights map[string]weightsSnapshot
+	var weights weightsSnapshot
 	latestStored := map[string]Observation{}
 	m.trackPendingLocked()
 	err := m.withDB(m.ProcessBudget+m.DBTimeout, func(ctx context.Context, db *sql.DB) error {
 		if !m.discovered {
 			// The accounts the database has records of, once per load:
 			// usage handling tracks new ones as they appear.
-			known, err := knownAccounts(ctx, db, m.Instance, m.trackedProvider())
+			known, err := knownAccounts(ctx, db, m.Instance)
 			if err != nil {
 				return err
 			}
@@ -423,28 +388,22 @@ func (m *Manager) refreshLocked() error {
 		if weights, err = m.refreshWeights(ctx, db, now); err != nil {
 			return err
 		}
+		params = m.settings.AccountParams()
 		for _, authIndex := range m.settings.authIndexes() {
 			cache := m.accounts[authIndex]
-			params := m.settings.accountParams(authIndex)
-			provider := weights[m.settings.AccountProvider(authIndex)]
 			stream := cache.stream
 			account := accountSnapshot{k: EstimateK(cache.buckets, params, now), cursor: stream.Cursor, kCursor: stream.K.Cursor,
-				window: stream.window(), paused: stream.Paused, pauseReason: stream.PauseReason, pausedSince: stream.PausedSince,
 				excluded: stream.Excluded}
 			account.raw = EstimateSegments(cache.segments, params, now)
 			account.weighted = account.raw
-			if len(provider.factors) > 0 {
-				account.weighted = EstimateSegments(ConvertSegments(cache.segments, provider.factors), params, now)
-			}
-			if account.window == WindowWeek {
-				// Segments of the 7-day window give its total; "" means 5 hours.
-				account.raw.Window, account.weighted.Window = WindowWeek, WindowWeek
+			if len(weights.factors) > 0 {
+				account.weighted = EstimateSegments(ConvertSegments(cache.segments, weights.factors), params, now)
 			}
 			account.estimate = account.raw
 			segments := cache.segments
-			if provider.basis == BasisWeighted {
+			if weights.basis == BasisWeighted {
 				account.estimate = account.weighted
-				segments = ConvertSegments(cache.segments, provider.factors)
+				segments = ConvertSegments(cache.segments, weights.factors)
 			}
 			account.trend = dailyTrend(cache.buckets, segments, SegmentExclusions(segments, params, now), m.location())
 			accounts[authIndex] = account
@@ -481,14 +440,6 @@ func (m *Manager) refreshLocked() error {
 	return nil
 }
 
-// trackedProvider is the tracked provider; it needs refreshMu.
-func (m *Manager) trackedProvider() string {
-	if m.template.Provider == "" {
-		return ProviderClaude
-	}
-	return m.template.Provider
-}
-
 func (m *Manager) location() *time.Location {
 	if m.TrendLocation == nil {
 		return time.UTC
@@ -510,10 +461,9 @@ func (m *Manager) LastError() string { return m.lastError.Load().(string) }
 // until, or until the deadline passes. Segments and k evidence keep separate
 // cursors, so k can be rebuilt without touching the segments.
 func (m *Manager) advance(ctx context.Context, db *sql.DB, authIndex string, cache *accountCache, until, deadline time.Time) error {
-	params := m.settings.accountParams(authIndex)
-	source := m.settings.accountSource(authIndex)
+	params := m.settings.AccountParams()
 	if cache.stream.Cursor.IsZero() || cache.stream.K.Cursor.IsZero() {
-		first, ok, err := firstReport(ctx, db, m.Instance, source, authIndex)
+		first, ok, err := firstReport(ctx, db, m.Instance, authIndex)
 		if err != nil || !ok {
 			return err
 		}
@@ -537,14 +487,14 @@ func (m *Manager) advance(ctx context.Context, db *sql.DB, authIndex string, cac
 		if end.After(until) {
 			end = until
 		}
-		observations, err := readObservations(ctx, db, m.Instance, source, authIndex, from, end)
+		observations, err := readObservations(ctx, db, m.Instance, authIndex, from, end)
 		if err != nil {
 			return err
 		}
 		next := cache.stream
 		var segments []Segment
 		if next.Cursor.Before(end) {
-			costs, err := readCosts(ctx, db, m.Instance, params.rules, authIndex, next.Cursor, end)
+			costs, err := readCosts(ctx, db, m.Instance, authIndex, next.Cursor, end)
 			if err != nil {
 				return err
 			}
@@ -556,10 +506,6 @@ func (m *Manager) advance(ctx context.Context, db *sql.DB, authIndex string, cac
 		}
 		if err := commitAdvance(ctx, db, m.Instance, authIndex, next, segments, buckets); err != nil {
 			return err
-		}
-		if next.restarted {
-			cache.segments = nil
-			next.restarted = false
 		}
 		cache.stream = next
 		cache.segments = append(cache.segments, segments...)
@@ -583,29 +529,7 @@ func (m *Manager) live() map[string]Observation {
 
 func accountStatus(snap *snapshot, latest map[string]Observation, authIndex string, now time.Time) AccountStatus {
 	account := snap.accounts[authIndex]
-	provider := snap.settings.AccountProvider(authIndex)
-	params := snap.settings.ParamsFor(provider)
-	status := ResolveAccount(authIndex, snap.settings.Accounts[authIndex], account.estimate, account.k, latest[authIndex], params, now)
-	status.Provider = provider
-	if params.rules.PauseWhenExhausted {
-		live := latest[authIndex]
-		current := live
-		// A window whose reset passed is no longer used up.
-		current.Has5h = live.Has5h && (live.Reset5h.IsZero() || live.Reset5h.After(now))
-		current.Has7d = live.Has7d && (live.Reset7d.IsZero() || live.Reset7d.After(now))
-		switch {
-		case current.exhausted():
-			status.Paused, status.PauseReason = true, PauseLimitReached
-			if account.paused {
-				status.PausedSince = account.pausedSince
-			}
-		case account.paused && (account.pauseReason == PauseCredits || !live.At.After(account.cursor)):
-			// The history is processed up to the cursor; a newer live
-			// report below the limit means the account recovered since.
-			status.Paused, status.PauseReason, status.PausedSince = true, account.pauseReason, account.pausedSince
-		}
-	}
-	return status
+	return ResolveAccount(authIndex, snap.settings.Accounts[authIndex], account.estimate, account.k, latest[authIndex], snap.settings.AccountParams(), now)
 }
 
 // current is the latest snapshot, or an empty one built from the settings
@@ -635,7 +559,7 @@ func (m *Manager) current() (*snapshot, bool) {
 		}
 		return &merged, true
 	}
-	snap := &snapshot{settings: settings, accounts: map[string]accountSnapshot{}, weights: map[string]weightsSnapshot{}}
+	snap := &snapshot{settings: settings, accounts: map[string]accountSnapshot{}}
 	for _, index := range settings.authIndexes() {
 		snap.accounts[index] = accountSnapshot{k: KEstimate{Basis: KBasisNone}}
 	}
@@ -648,7 +572,7 @@ type AccountView struct {
 	Cursor       time.Time      `json:"cursor,omitzero"`
 	KCursor      time.Time      `json:"k_cursor,omitzero"`
 	RecentBlocks []BlockSummary `json:"recent_blocks"`
-	// Excluded is the cost the provider's segment rules left out.
+	// Excluded is the cost left out of the segments.
 	Excluded ExcludedCost `json:"excluded"`
 	// Basis is the basis of the estimate; Weights the multipliers it uses.
 	Basis   string            `json:"basis"`
@@ -680,26 +604,24 @@ func (m *Manager) View() View {
 	now := m.host.Now()
 	latest := m.live()
 	view := View{Accounts: []AccountView{}, Error: m.LastError(), At: snap.at, Loaded: loaded}
+	params := snap.settings.AccountParams()
+	weights := snap.weights
 	for _, index := range snap.settings.authIndexes() {
 		cached := snap.accounts[index]
-		provider := snap.settings.AccountProvider(index)
-		params := snap.settings.ParamsFor(provider)
 		account := AccountView{AccountStatus: accountStatus(snap, latest, index, now), RecentBlocks: []BlockSummary{},
 			Cursor: cached.cursor, KCursor: cached.kCursor, Excluded: cached.excluded, Forecast: cached.forecast,
 			ColdStartBlocks: params.ColdStartBlocks, SafetyFactor: params.SafetyFactor, Basis: BasisRaw, Weights: []EffectiveWeight{},
 			WeightEstimate: WeightEstimate{Items: []ItemEstimate{}}}
-		if weights, ok := snap.weights[provider]; ok {
-			if weights.basis != "" {
-				account.Basis = weights.basis
-			}
-			if weights.effective != nil {
-				account.Weights = weights.effective
-			}
-			if weights.estimate.Items != nil {
-				account.WeightEstimate = weights.estimate
-			}
+		if weights.basis != "" {
+			account.Basis = weights.basis
 		}
-		account.WeightsEnabled = snap.settings.provider(provider).Weights.Enabled
+		if weights.effective != nil {
+			account.Weights = weights.effective
+		}
+		if weights.estimate.Items != nil {
+			account.WeightEstimate = weights.estimate
+		}
+		account.WeightsEnabled = snap.settings.Weights.Enabled
 		blocks := cached.estimate.Blocks
 		account.RecentBlocks = slices.Clone(blocks[max(0, len(blocks)-20):])
 		slices.Reverse(account.RecentBlocks)
@@ -711,38 +633,18 @@ func (m *Manager) View() View {
 	return view
 }
 
-// segmentWindow names the window an estimate's segments measure.
-func segmentWindow(window string) string {
-	if window == WindowWeek {
-		return WindowWeek
-	}
-	return WindowFiveHour
-}
-
-// AccountSource is where a tracked account's main window reports come from;
-// false when the account is not tracked.
-func (m *Manager) AccountSource(authIndex string) (QuotaSource, bool) {
-	settings := m.loaded.Load()
-	if _, ok := settings.Accounts[authIndex]; !ok {
-		return QuotaSource{}, false
-	}
-	return settings.accountSource(authIndex), true
-}
-
 // readLatest reads the stored reports a refresh merges into the live state;
 // tests replace it.
 var readLatest = latestObservations
 
 // latestObservations reads each tracked account's latest main window reports
-// made since since: the newest report of each window, and the newest credit
-// balance any report named.
+// made since since: the newest report of each window.
 func latestObservations(ctx context.Context, db *sql.DB, instance string, settings Settings, since time.Time) (map[string]Observation, error) {
 	result := map[string]Observation{}
 	for _, index := range settings.authIndexes() {
-		source := settings.accountSource(index)
 		var merged Observation
 		for _, length := range []time.Duration{FiveHours, Week} {
-			point, ok, err := latestWindowPoint(ctx, db, instance, source, index, length, since)
+			point, ok, err := latestWindowPoint(ctx, db, instance, index, length, since)
 			if err != nil {
 				return nil, err
 			}
@@ -757,15 +659,6 @@ func latestObservations(ctx context.Context, db *sql.DB, instance string, settin
 			if point.At.After(merged.At) {
 				merged.At = point.At
 			}
-		}
-		var credits sql.NullFloat64
-		err := db.QueryRowContext(ctx, `SELECT credit_balance FROM quota_reports WHERE instance = $1 AND auth_index = $2 AND provider = $3
-			AND at_ns >= $4 AND credit_balance IS NOT NULL ORDER BY at_ns DESC, id DESC LIMIT 1`, instance, index, source.Provider, nanos(since)).Scan(&credits)
-		if err != nil && err != sql.ErrNoRows {
-			return nil, fmt.Errorf("Read quota reports: %w", err)
-		}
-		if credits.Valid && finite(credits.Float64) {
-			merged.HasCredits, merged.Credits = true, credits.Float64
 		}
 		if merged.Has5h || merged.Has7d {
 			result[index] = merged

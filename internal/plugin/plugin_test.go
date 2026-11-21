@@ -16,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/sketchain/cpa-quota/internal/ccbilling"
 	"github.com/sketchain/cpa-quota/internal/pgtest"
 )
 
@@ -90,7 +89,7 @@ func newHarness(t *testing.T, dsn string, extra string) *harness {
 		logs = append(logs, level+": "+message)
 	})
 	base := fmt.Sprintf("enabled: true\ninstance: cc-1\npostgres_dsn: %q\npostgres_schema: %s\napi_token: read-token\nadmin_token: admin-token\n"+
-		"price_url: %s\nsubscription: claude\ntier: max5x\ndb_timeout_seconds: 2\n", dsn, schema, h.prices.URL)
+		"price_url: %s\ntier: max5x\ndb_timeout_seconds: 2\n", dsn, schema, h.prices.URL)
 	// Keys in extra replace the base ones.
 	var lines []string
 	for _, line := range strings.Split(base, "\n") {
@@ -183,9 +182,9 @@ func TestConfigRequiresInstanceAndDSN(t *testing.T) {
 	for _, test := range []struct{ yaml, want string }{
 		{"postgres_dsn: x", "instance is required"},
 		{"instance: a", "postgres_dsn is required"},
-		{"instance: a\npostgres_dsn: x\nsubscription: gemini", "subscription must be claude or chatgpt"},
-		{"instance: a\npostgres_dsn: x\nsubscription: chatgpt\ntier: max5x", `tier "max5x" is not a tier of chatgpt`},
-		{"instance: a\npostgres_dsn: x\ntier_k: {team: 3}", `"team" is not a tier of claude`},
+		{"instance: a\npostgres_dsn: x\ntier: team", `tier "team" is not a Claude subscription tier`},
+		{"instance: a\npostgres_dsn: x\ntier_k: {team: 3}", `"team" is not a Claude subscription tier`},
+		{"instance: a\npostgres_dsn: x\ntier_weekly_usd: {plus: 30}", `"plus" is not a Claude subscription tier`},
 		{"instance: a\npostgres_dsn: x\nsafety_factor: 1.5", "safety_factor"},
 		{"instance: a\npostgres_dsn: x\nestimation: {window_percent: 0}", "window_percent"},
 		{"instance: a\npostgres_dsn: x\ntrend_timezone: Mars/Base", "trend_timezone"},
@@ -195,16 +194,16 @@ func TestConfigRequiresInstanceAndDSN(t *testing.T) {
 			t.Errorf("%q: %v", test.yaml, err)
 		}
 	}
-	config, err := ParseConfig([]byte("instance: cc-1\npostgres_dsn: postgres://x\nsubscription: ChatGPT\nmanual_k: 7\n" +
-		"model_weights: {enabled: true, items: [{id: spark, models: [gpt-5.3-codex-spark]}]}"))
+	config, err := ParseConfig([]byte("instance: cc-1\npostgres_dsn: postgres://x\ntier: Max20x\nmanual_k: 7\ntier_weekly_usd: {max20x: 3000}\n" +
+		"model_weights: {enabled: true, items: [{id: fable, models: [claude-fable-5-2]}]}"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings, _ := config.Settings()
-	params := settings.ParamsFor(ccbilling.ProviderCodex)
-	if config.Provider() != ccbilling.ProviderCodex || *config.ManualK != 7 || config.PriceURL != DefaultPriceURL || config.SafetyFactor != 0.9 ||
+	params := settings.AccountParams()
+	if config.Tier != "max20x" || *config.ManualK != 7 || config.PriceURL != DefaultPriceURL || config.SafetyFactor != 0.9 ||
 		params.ColdStartBlocks != 20 || params.WindowPercent != 8 || params.BlockGapMinutes != 5 || params.RecentDays != 14 ||
-		!settings.Providers[ccbilling.ProviderCodex].Weights.Enabled || config.AccountAuthTypes[0] != "oauth" {
+		params.TierWeekly("max20x") != 3000 || !settings.Weights.Enabled || config.AccountAuthTypes[0] != "oauth" {
 		t.Fatalf("config = %+v", config)
 	}
 }
@@ -213,32 +212,35 @@ func TestUsageIsPricedRecordedAndObserved(t *testing.T) {
 	h := newHarness(t, "", "")
 	at := h.clock.Now().Add(-time.Minute)
 	h.call(MethodUsageHandle, claudeRecord("req-1", at, 12, 34))
-	// An API key credential and another provider do not count.
+	// An API key credential and another provider's record do not count.
 	apiKey := claudeRecord("req-2", at, 99, 99)
 	apiKey["AuthType"] = "apikey"
 	h.call(MethodUsageHandle, apiKey)
-	codex := claudeRecord("req-3", at, 99, 99)
-	codex["Provider"] = "codex"
-	h.call(MethodUsageHandle, codex)
+	other := claudeRecord("req-3", at, 99, 99)
+	other["Provider"] = "gemini"
+	h.call(MethodUsageHandle, other)
 	var cost float64
 	var model, accounting string
 	var output int64
-	var mainWindow, priced bool
-	if err := h.db.QueryRow(`SELECT cost_usd, model, accounting, output_tokens, main_window, priced FROM requests WHERE instance = 'cc-1' AND request_id = 'req-1'`).
-		Scan(&cost, &model, &accounting, &output, &mainWindow, &priced); err != nil {
+	var priced bool
+	if err := h.db.QueryRow(`SELECT cost_usd, model, accounting, output_tokens, priced FROM requests WHERE instance = 'cc-1' AND request_id = 'req-1'`).
+		Scan(&cost, &model, &accounting, &output, &priced); err != nil {
 		t.Fatal(err)
 	}
 	// $5 input, $25 output, $0.50 cache read, $6.25 cache write per 1M;
 	// reasoning is inside Claude's output.
 	want := (1000*5 + 2000*25 + 10000*0.5 + 4000*6.25) / 1e6
-	if math.Abs(cost-want) > 1e-12 || model != "claude-opus-4-8" || accounting != "complete" || output != 2000 || !mainWindow || !priced {
-		t.Fatalf("request = %v %s %s %d %v %v", cost, model, accounting, output, mainWindow, priced)
+	if math.Abs(cost-want) > 1e-12 || model != "claude-opus-4-8" || accounting != "complete" || output != 2000 || !priced {
+		t.Fatalf("request = %v %s %s %d %v", cost, model, accounting, output, priced)
 	}
 	if n := h.count(`SELECT count(*) FROM requests`); n != 1 {
 		t.Fatalf("requests = %d", n)
 	}
 	if n := h.count(`SELECT count(*) FROM quota_report_windows WHERE instance = 'cc-1' AND limit_key = 'unified'`); n != 2 {
 		t.Fatalf("windows = %d", n)
+	}
+	if n := h.count(`SELECT count(*) FROM quota_reports`); n != 1 {
+		t.Fatalf("reports = %d", n)
 	}
 	// Redelivery changes nothing.
 	h.call(MethodUsageHandle, claudeRecord("req-1", at, 12, 34))
@@ -256,6 +258,11 @@ func TestUsageIsPricedRecordedAndObserved(t *testing.T) {
 		account["k_source"] != "default" || week["used_percent"] != 34.0 || week["total_usd"] != 1250.0 ||
 		math.Abs(week["remaining_usd"].(float64)-0.9*1250*0.66) > 1e-9 {
 		t.Fatalf("account = %v", account)
+	}
+	for _, removed := range []string{"provider", "subscription", "pause_reason", "segment_window"} {
+		if _, ok := account[removed]; ok {
+			t.Fatalf("account has %s: %v", removed, account)
+		}
 	}
 }
 
@@ -276,10 +283,13 @@ func TestQuotaAPIAuthenticationAndFields(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("quota = %d", status)
 	}
-	for _, field := range []string{"plugin", "version", "instance", "generated_at", "subscription", "tier", "price_table", "database", "estimates", "accounts"} {
+	for _, field := range []string{"plugin", "version", "instance", "generated_at", "tier", "price_table", "database", "estimates", "accounts"} {
 		if _, ok := body[field]; !ok {
 			t.Fatalf("missing %s in %v", field, body)
 		}
+	}
+	if _, ok := body["subscription"]; ok || body["tier"] != "max5x" {
+		t.Fatalf("quota = %v", body)
 	}
 	prices := body["price_table"].(map[string]any)
 	database := body["database"].(map[string]any)

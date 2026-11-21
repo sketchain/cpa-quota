@@ -176,7 +176,6 @@ func (m *Manager) forecastLocked(snap *snapshot, now time.Time) {
 		account := snap.accounts[index]
 		account.forecast = unknownForecast()
 		account.forecast.At, account.forecast.Window5h, account.forecast.Window7d = now, int64(w5/time.Second), int64(w7/time.Second)
-		source := snap.settings.accountSource(index)
 		history := accountHistory{points: map[time.Duration]accountPoints{}}
 		err := m.withDB(m.DBTimeout, func(ctx context.Context, db *sql.DB) error {
 			var err error
@@ -189,10 +188,10 @@ func (m *Manager) forecastLocked(snap *snapshot, now time.Time) {
 			for _, window := range []struct{ length, span time.Duration }{{FiveHours, w5}, {Week, w7}} {
 				var entry accountPoints
 				from := now.Add(-window.span)
-				if entry.before, entry.hasBefore, err = lastWindowPoint(ctx, db, m.Instance, source, index, window.length, from); err != nil {
+				if entry.before, entry.hasBefore, err = lastWindowPoint(ctx, db, m.Instance, index, window.length, from); err != nil {
 					return err
 				}
-				if entry.points, err = readWindowPoints(ctx, db, m.Instance, source, index, window.length, from, now); err != nil {
+				if entry.points, err = readWindowPoints(ctx, db, m.Instance, index, window.length, from, now); err != nil {
 					return err
 				}
 				history.points[window.length] = entry
@@ -205,7 +204,7 @@ func (m *Manager) forecastLocked(snap *snapshot, now time.Time) {
 			continue
 		}
 		status := accountStatus(snap, latest, index, now)
-		conversion := NewBasisConversion(providerWeights(snap, status.Provider), nil)
+		conversion := NewBasisConversion(estimateWeights(snap), nil)
 		sum := func(rows []SpendRow) [2]float64 {
 			var total [2]float64
 			for _, row := range rows {
@@ -260,11 +259,11 @@ func (m *Manager) forecastLocked(snap *snapshot, now time.Time) {
 	}
 }
 
-// providerWeights is the basis and multipliers of one provider's estimates in
+// estimateWeights is the basis and multipliers of the estimates in
 // a snapshot.
-func providerWeights(snap *snapshot, provider string) ProviderWeights {
-	weights := snap.weights[provider]
-	entry := ProviderWeights{Basis: weights.basis, Weights: slices.Clone(weights.effective)}
+func estimateWeights(snap *snapshot) BasisWeights {
+	weights := snap.weights
+	entry := BasisWeights{Basis: weights.basis, Weights: slices.Clone(weights.effective)}
 	if entry.Basis == "" {
 		entry.Basis = BasisRaw
 	}

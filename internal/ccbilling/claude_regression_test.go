@@ -29,8 +29,8 @@ func claudeRegressionDigest(t *testing.T) string {
 	t.Cleanup(func() { readLatest = saved })
 	facts := newFacts(t, host)
 	for i, obs := range sim.obs {
-		facts.request("a1", ProviderClaude, obs.At, sim.costs[i].At.Sub(obs.At), sim.costs[i].USD, "claude-test", true, true)
-		facts.report("a1", ProviderClaude, obs.At, "", claudeWindows(obs)...)
+		facts.request("a1", obs.At, sim.costs[i].At.Sub(obs.At), sim.costs[i].USD, "claude-test", true)
+		facts.report("a1", obs.At, claudeWindows(obs)...)
 	}
 	facts.flush()
 	manager := newTestManager(host)

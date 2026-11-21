@@ -26,7 +26,7 @@ func TestStreamsWithoutKCursorRebuildKEvidenceAndKeepSegments(t *testing.T) {
 	f := newFacts(t, host)
 	for i := 0; i < 240; i++ {
 		at := start.Add(time.Duration(i) * time.Minute)
-		f.report("a1", ProviderClaude, at, "", testWindow{"unified", 18000, float64(i / 2), reset5}, testWindow{"unified", 604800, float64(i / 12), reset7})
+		f.report("a1", at, testWindow{"unified", 18000, float64(i / 2), reset5}, testWindow{"unified", 604800, float64(i / 12), reset7})
 	}
 	f.flush()
 	// A stream saved before k evidence existed: segments, but no k cursor.
@@ -64,7 +64,7 @@ func TestInstancesSharingTheDatabaseStayApart(t *testing.T) {
 	// The other instance has an account of the same auth index with one
 	// report of its own.
 	f := newFacts(t, host)
-	f.report("a1", ProviderClaude, host.now.Add(-time.Hour), "", testWindow{"unified", 18000, 77, host.now.Add(time.Hour)})
+	f.report("a1", host.now.Add(-time.Hour), testWindow{"unified", 18000, 77, host.now.Add(time.Hour)})
 	f.flush()
 	if _, err := host.db.Exec(`UPDATE quota_reports SET instance = 'other' WHERE id = $1`, host.nextID.Load()); err != nil {
 		t.Fatal(err)
@@ -159,11 +159,11 @@ func TestRebuildRecreatesTheSameEstimate(t *testing.T) {
 	}
 }
 
-func TestTrackingFollowsTheProviderAndTheAllowedAccounts(t *testing.T) {
+func TestTrackingFollowsTheDatabaseAndTheAllowedAccounts(t *testing.T) {
 	host := newFakeHost(t)
 	f := newFacts(t, host)
-	for _, account := range []struct{ index, provider string }{{"a1", ProviderClaude}, {"a2", ProviderClaude}, {"c1", ProviderCodex}} {
-		f.request(account.index, account.provider, host.now.Add(-time.Hour), time.Second, 1, "m", true, true)
+	for _, index := range []string{"a1", "a2"} {
+		f.request(index, host.now.Add(-time.Hour), time.Second, 1, "m", true)
 	}
 	f.flush()
 	manager := newTestManager(host)
@@ -173,7 +173,7 @@ func TestTrackingFollowsTheProviderAndTheAllowedAccounts(t *testing.T) {
 	if err := manager.Refresh(); err != nil {
 		t.Fatal(err)
 	}
-	// The database's accounts of the provider are tracked; Codex's are not.
+	// The database's accounts are tracked.
 	if got := manager.Settings().authIndexes(); !slices.Equal(got, []string{"a1", "a2"}) {
 		t.Fatalf("tracked = %v", got)
 	}
@@ -188,29 +188,6 @@ func TestTrackingFollowsTheProviderAndTheAllowedAccounts(t *testing.T) {
 	}
 	if got := manager.Settings().authIndexes(); !slices.Equal(got, []string{"a2", "a3"}) {
 		t.Fatalf("tracked = %v", got)
-	}
-	// Switching to Codex tracks its accounts only.
-	if _, err := manager.Configure(DefaultSettings(), AccountSettings{Provider: ProviderCodex}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.Refresh(); err != nil {
-		t.Fatal(err)
-	}
-	quotas := manager.Quotas()
-	if len(quotas) != 1 || quotas[0].AuthIndex != "c1" || quotas[0].Subscription != SubscriptionChatGPT || quotas[0].Tier != TierTeam ||
-		quotas[0].KSource != KSourceNone || quotas[0].Week.TotalUSD != 60 {
-		t.Fatalf("codex quotas = %+v", quotas)
-	}
-}
-
-func TestQuotaReportsPauses(t *testing.T) {
-	host := newFakeHost(t)
-	manager := newTestManager(host)
-	configure(t, manager, DefaultSettings(), AccountSettings{Provider: ProviderCodex}, "c1")
-	manager.Observe("c1", Observation{At: host.now, Has5h: true, Used5h: 100, Reset5h: host.now.Add(time.Hour), LimitReached: true})
-	quota := manager.Quotas()[0]
-	if quota.State != StatePaused || quota.PauseReason != PauseLimitReached || quota.FiveHour.RemainingUSD != 0 {
-		t.Fatalf("paused quota = %+v", quota)
 	}
 }
 

@@ -32,10 +32,10 @@ type BasisConversion struct {
 	Priced []string `json:"priced_models"`
 }
 
-// NewBasisConversion builds the conversion of one provider's estimates'
+// NewBasisConversion builds the conversion of the estimates'
 // basis. prices holds, by model, the price table multiplier of models with a
 // custom price whose input and output multipliers agree.
-func NewBasisConversion(estimates ProviderWeights, prices map[string]float64) BasisConversion {
+func NewBasisConversion(estimates BasisWeights, prices map[string]float64) BasisConversion {
 	conversion := BasisConversion{Basis: estimates.Basis, Factors: map[string]float64{}, Priced: []string{}}
 	if conversion.Basis == "" {
 		conversion.Basis = BasisRaw
@@ -112,11 +112,11 @@ type WindowPoint struct {
 
 // readWindowPoints reads an account's reports of one main window made in
 // (from, to], oldest first.
-func readWindowPoints(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string, length time.Duration, from, to time.Time) ([]WindowPoint, error) {
+func readWindowPoints(ctx context.Context, db *sql.DB, instance, authIndex string, length time.Duration, from, to time.Time) ([]WindowPoint, error) {
 	rows, err := db.QueryContext(ctx, `SELECT at_ns, used_percent, reset_ns FROM quota_report_windows
-		WHERE instance = $1 AND auth_index = $2 AND provider = $3 AND limit_key = $4 AND seconds = $5 AND at_ns > $6 AND at_ns <= $7
+		WHERE instance = $1 AND auth_index = $2 AND limit_key = $3 AND seconds = $4 AND at_ns > $5 AND at_ns <= $6
 		ORDER BY at_ns, report_id`,
-		instance, authIndex, source.Provider, source.LimitKey, int64(length/time.Second), nanos(from), nanos(to))
+		instance, authIndex, mainLimitKey, int64(length/time.Second), nanos(from), nanos(to))
 	if err != nil {
 		return nil, fmt.Errorf("Read quota reports: %w", err)
 	}
@@ -134,22 +134,22 @@ func readWindowPoints(ctx context.Context, db *sql.DB, instance string, source Q
 }
 
 // lastWindowPoint is an account's latest report of a window made at or before at.
-func lastWindowPoint(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string, length time.Duration, at time.Time) (WindowPoint, bool, error) {
-	return windowPoint(ctx, db, `at_ns <= $6`, instance, source, authIndex, length, at)
+func lastWindowPoint(ctx context.Context, db *sql.DB, instance, authIndex string, length time.Duration, at time.Time) (WindowPoint, bool, error) {
+	return windowPoint(ctx, db, `at_ns <= $5`, instance, authIndex, length, at)
 }
 
 // latestWindowPoint is an account's latest report of a window made at or after since.
-func latestWindowPoint(ctx context.Context, db *sql.DB, instance string, source QuotaSource, authIndex string, length time.Duration, since time.Time) (WindowPoint, bool, error) {
-	return windowPoint(ctx, db, `at_ns >= $6`, instance, source, authIndex, length, since)
+func latestWindowPoint(ctx context.Context, db *sql.DB, instance, authIndex string, length time.Duration, since time.Time) (WindowPoint, bool, error) {
+	return windowPoint(ctx, db, `at_ns >= $5`, instance, authIndex, length, since)
 }
 
-func windowPoint(ctx context.Context, db *sql.DB, condition, instance string, source QuotaSource, authIndex string, length time.Duration, at time.Time) (WindowPoint, bool, error) {
+func windowPoint(ctx context.Context, db *sql.DB, condition, instance, authIndex string, length time.Duration, at time.Time) (WindowPoint, bool, error) {
 	var point WindowPoint
 	var when, reset int64
 	err := db.QueryRowContext(ctx, `SELECT at_ns, used_percent, reset_ns FROM quota_report_windows
-		WHERE instance = $1 AND auth_index = $2 AND provider = $3 AND limit_key = $4 AND seconds = $5 AND `+condition+`
+		WHERE instance = $1 AND auth_index = $2 AND limit_key = $3 AND seconds = $4 AND `+condition+`
 		ORDER BY at_ns DESC, report_id DESC LIMIT 1`,
-		instance, authIndex, source.Provider, source.LimitKey, int64(length/time.Second), nanos(at)).Scan(&when, &point.Used, &reset)
+		instance, authIndex, mainLimitKey, int64(length/time.Second), nanos(at)).Scan(&when, &point.Used, &reset)
 	switch {
 	case err == sql.ErrNoRows:
 		return WindowPoint{}, false, nil

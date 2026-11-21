@@ -1,5 +1,5 @@
 // Package pricing turns a new-api ratio table into USD prices and prices the
-// token usage CLIProxyAPI reports for Claude and Codex requests.
+// token usage CLIProxyAPI reports for Claude requests.
 package pricing
 
 import (

@@ -2,7 +2,7 @@
 
 CPA Quota 是 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) v8 的插件（Go 编写的 c-shared 动态库），只做三件事：
 
-1. **额度估算**：根据经插件计价的请求费用和响应头报告的 5 小时 / 7 天利用率，估算订阅账号（Claude Pro / Max 5x / Max 20x，ChatGPT Team）的 5 小时与 7 天总额和剩余额度（USD）。
+1. **额度估算**：根据经插件计价的请求费用和响应头报告的 5 小时 / 7 天利用率，估算 Claude 订阅账号（Pro / Max 5x / Max 20x）的 5 小时与 7 天总额和剩余额度（USD）。插件只服务 Claude 订阅账号，其他 provider 的用量记录一律忽略。
 2. **额度接口**：通过带 token 的只读 HTTP 接口提供估算结果，同时写入 PostgreSQL 供下游直接查询。
 3. **记录 safeguard 事件**：Claude 以安全策略拒绝请求时记一行。
 
@@ -39,8 +39,7 @@ plugins:
       postgres_dsn: "postgres://cpa:secret@db.internal:5432/quota?sslmode=require"   # 必填
       api_token: "change-me-read-only"
       admin_token: "change-me-admin"
-      subscription: claude                   # claude | chatgpt
-      tier: max5x                            # claude: pro | max5x | max20x；chatgpt: team
+      tier: max5x                            # pro | max5x | max20x
       # manual_k: 6.5
       # safety_factor: 0.9
       # model_weights:
@@ -62,15 +61,13 @@ plugins:
 | `price_refresh_hours` | `24` | 倍率表超过这个时长后，下一次 `usage.handle` 同步刷新。 |
 | `price_retry_minutes` | `5` | 刷新失败后的最短重试间隔，避免每条用量都去请求。 |
 | `price_timeout_seconds` | `5` | 拉取倍率表的超时。 |
-| `subscription` | `claude` | 订阅类型：`claude` 或 `chatgpt`（CPA 的 Codex 通道）。 |
-| `tier` | 订阅的第一档 | Claude：`pro`（默认）/ `max5x` / `max20x`；ChatGPT：`team`。 |
+| `tier` | `pro` | Claude 订阅档位：`pro` / `max5x` / `max20x`。 |
 | `manual_k` | 无 | 手动指定周额度 / 5 小时额度比值（1–100），优先于估算值。 |
 | `safety_factor` | `0.9` | 安全系数，剩余额度 R = 系数 × T × (1 − u)。 |
-| `tier_weekly_usd` | Claude `pro: 250, max5x: 1250, max20x: 2500`；ChatGPT `team: 60` | 冷启动时使用的档位周总额，可按档位覆盖。 |
-| `tier_k` | Claude 各档 `8`；ChatGPT 无 | 没有手动和估算 k 时使用的档位默认 k，可按档位覆盖。 |
-| `auth_indexes` | 空 | 非空时只统计这些账号，并且启动即列出它们；为空时自动跟踪出现的同订阅账号。 |
+| `tier_weekly_usd` | `pro: 250, max5x: 1250, max20x: 2500` | 冷启动时使用的档位周总额，可按档位覆盖。 |
+| `tier_k` | 各档 `8` | 没有手动和估算 k 时使用的档位默认 k，可按档位覆盖。 |
+| `auth_indexes` | 空 | 非空时只统计这些账号，并且启动即列出它们；为空时自动跟踪出现的 Claude 账号。 |
 | `account_auth_types` | `[oauth]` | 计入的凭证类型（CPA 的 `AuthType`：`oauth`、`apikey`）。 |
-| `codex_fast_mode_billing` | `false` | 开启后 ChatGPT `priority` 请求（按客户端请求的 service tier 判断）按 2.5 倍计费。 |
 | `db_timeout_seconds` | `3` | 连接与每次数据库操作的超时。 |
 | `db_retry_seconds` | `60` | 数据库不可用后的最短重连间隔。 |
 | `refresh_interval_seconds` | `60` | 估算刷新的最短间隔。 |
@@ -94,20 +91,20 @@ plugins:
 | `model_weights.items` | `[]` | 待测模型：`id`、`name`、`models`（计费模型名）、`manual_multiplier`。 |
 | `model_weights.min_segments` / `min_cost_usd` / `min_share_spread` | `30` / `20` / `0.05` | 倍率估算的最少样本条件。 |
 
-配置不合法（缺 `instance` / `postgres_dsn`、档位不属于订阅等）时插件注册失败并在 CPA 日志中给出原因。
+配置不合法（缺 `instance` / `postgres_dsn`、档位不是 Claude 的档位等）时插件注册失败并在 CPA 日志中给出原因。
 
 ## 估算方法
 
 估算核心在 `internal/ccbilling`：
 
 - 每次利用率跨过一个整数点切出一段（1% 段），记录这段期间完成的请求费用；百分比带小数时按跨整数点切段。
-- 主窗口内的请求只要费用没能算出来（模型未定价，或用量不完整、不可计费），它完成时所在的段就作废：不写入 `segments`，不参与总额估算和模型倍率估算 / 校准，大块照常延续（作废段的增量和费用一起剔除，不影响相邻段的滑动窗口）。作废段按原因计数（目前只有 `unpriced`），见下文「费用缺失的请求」。
+- 请求只要费用没能算出来（模型未定价，或用量不完整、不可计费），它完成时所在的段就作废：不写入 `segments`，不参与总额估算和模型倍率估算 / 校准，大块照常延续（作废段的增量和费用一起剔除，不影响相邻段的滑动窗口）。作废段按原因计数（目前只有 `unpriced`），见下文「费用缺失的请求」。
 - 相邻数据点间隔超过 5 分钟断开大块；用 8% 宽的滑动窗口比较「点数 / 美元」，剔除可疑（被外部用量污染）的段。
 - 各大块的干净比值按干净增量的平方加权，近 14 天占 90%，得到 5 小时总额 T5 = 100 / 比值。
 - k（周 / 5 小时）只由两窗口同期的利用率增量估算，不用段和费用，因此不受费用缺失影响；周总额 T7 = k × T5；手动 k 优先，其次估算值，最后档位默认值。
 - 干净大块少于 20 时冷启动，周总额取档位默认值。
 - 剩余额度 R = 0.9 × T × (1 − u)，u 为当前窗口利用率。
-- Claude 读 `anthropic-ratelimit-unified-5h/7d-*`；ChatGPT 读 `X-Codex-Primary/Secondary-*`，只把主额度（premium）的 5 小时 / 周窗口计入，额度用满或在扣 credits 时暂停切段；只有 7 天窗口的账号按 7 天窗口切段。
+- 利用率读自 Claude 的 `anthropic-ratelimit-unified-5h/7d-*` 响应头；段按 5 小时窗口切。
 - 另外计算模型倍率（按各段的模型费用拆分估算，或按校准时段测量）、两个窗口的消耗预测（回看 `forecast_window_*`）和每日 k 趋势（按 `trend_timezone` 切天）。
 
 ## 价格
@@ -121,16 +118,15 @@ plugins:
 
 某个比率缺失时按 1 处理，即该部分按输入单价计费。表里没有的模型视为未定价，`requests.cost_usd` 记 0、`priced` 为 false。
 
-模型按「上游模型名 → 客户端别名」的顺序查找，忽略大小写、`(high)` 之类的请求选项、`/` 之前的命名空间和 `-high` / `-low` 后缀。token 按 CPA 对 Claude（输入、缓存读写分列，输出已含推理）和 Codex（缓存含在输入里，推理含在输出里）的口径拆分，推理不重复计费；计数自相矛盾或只有总数的用量（`accounting` 为 `inconsistent` / `unclassified`）记录但不计费，`cost_usd` 记 0。
+模型按「上游模型名 → 客户端别名」的顺序查找，忽略大小写、`(high)` 之类的请求选项、`/` 之前的命名空间和 `-high` / `-low` 后缀。token 按 CPA 对 Claude 的口径拆分（输入、缓存读写分列，输出已含推理），推理不重复计费；计数自相矛盾的用量（`accounting` 为 `inconsistent`）记录但不计费，`cost_usd` 记 0。
 
 ### 费用缺失的请求
 
-记 0 的费用不是真实费用，把它算进段会让段显得偏便宜、周总额被低估，所以对所有订阅一视同仁：
+记 0 的费用不是真实费用，把它算进段会让段显得偏便宜、周总额被低估：
 
-- 主窗口内的请求，模型未定价且报告了用量，或者用量不完整（`inconsistent` / `unclassified`），它完成时所在的段作废，原因记为 `unpriced`。没有报告任何用量的请求（如失败请求）费用确实为 0，不导致作废。
+- 请求的模型未定价且报告了用量，或者用量不完整（`inconsistent`），它完成时所在的段作废，原因记为 `unpriced`。没有报告任何用量的请求（如失败请求）费用确实为 0，不导致作废。
 - 落在大块第一次跨点之前的请求本来就不属于任何段，不作废任何段。
-- ChatGPT 中属于另一个额度池的请求（响应没有主额度窗口，原因 `other_limit`，包括没有额度报告的请求）照旧只剔除自身费用，段不作废，即使它的模型未定价。
-- 诊断：`streams.state` 的 `excluded` 中，`requests` / `usd` 按原因统计被剔除的请求数与费用，`unpriced_models` 列出未定价模型及其请求数（最多 50 个，Claude 和 ChatGPT 都会列出），`voided_segments` 按原因统计作废段数；额度接口的 `estimate.voided_segments` 给出作废段总数。
+- 诊断：`streams.state` 的 `excluded` 中，`requests` / `usd` 按原因统计被剔除的请求数与费用，`unpriced_models` 列出未定价模型及其请求数（最多 50 个），`voided_segments` 按原因统计作废段数；额度接口的 `estimate.voided_segments` 给出作废段总数。
 
 刷新：注册时拉一次；之后 `usage.handle` 发现距上次成功超过 24 小时就同步拉一次（失败沿用旧表并写日志，5 分钟内不重试）。最近一次成功的倍率表存进 PostgreSQL；启动时拉取失败就用库里的。
 
@@ -146,19 +142,18 @@ plugins:
 
 | 列 | 说明 |
 | --- | --- |
-| `instance`, `auth_index`, `provider` | 实例、账号、`claude` / `codex` |
+| `instance`, `auth_index` | 实例、账号 |
 | `request_id` | CPA 的 RequestID |
 | `requested_ns` / `requested_at`, `latency_ms`, `completed_ns` | 请求开始时间、耗时、完成时间（费用在完成时计入） |
 | `model`, `upstream_model`, `service_tier`, `stream` | 计费模型名（别名优先）、上游模型名、请求的 service tier、是否流式 |
 | `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`, `total_tokens` | 计价口径的 token：未缓存输入、缓存读、缓存写、计费输出（含推理）、其中推理、总数 |
-| `accounting` | `complete` / `inconsistent` / `unclassified`，空表示未报告用量；只有 `complete` 计费 |
+| `accounting` | `complete` / `inconsistent`，空表示未报告用量；只有 `complete` 计费 |
 | `cost_usd`, `priced` | 费用（USD）、模型是否在倍率表里 |
-| `main_window` | 本请求的响应是否报告了主额度窗口（ChatGPT 只计入为 true 的请求） |
 | `failed`, `status_code` | 是否失败、失败状态码 |
 
-**`quota_reports`**：每个带额度响应头的请求一行：`instance`、`auth_index`、`provider`、`request_id`、`at_ns`（请求开始时间）、`plan`、`credit_balance`、`credits_unlimited`、`limit_reached`。
+**`quota_reports`**：每个带额度响应头的请求一行：`instance`、`auth_index`、`request_id`、`at_ns`（请求开始时间）。
 
-**`quota_report_windows`**：报告中的每个窗口：`report_id`、`instance`、`auth_index`、`provider`、`limit_key`（Claude `unified`；ChatGPT 主额度 `codex`、代码审查 `code-review`、附加额度用其名称）、`seconds`（18000 / 604800 等）、`at_ns`、`used_percent`、`reset_ns` / `reset_at`。
+**`quota_report_windows`**：报告中的每个窗口：`report_id`、`instance`、`auth_index`、`limit_key`（Claude 统一额度为 `unified`）、`seconds`（18000 / 604800）、`at_ns`、`used_percent`、`reset_ns` / `reset_at`。
 
 **`safeguard_events`**：见下文。
 
@@ -168,13 +163,13 @@ plugins:
 
 | 表 | 主键 | 内容 |
 | --- | --- | --- |
-| `streams` | `instance, auth_index` | 增量处理位置（JSON）：游标、窗口跟踪、当前大块（含待作废标记）、暂停状态、`excluded`（被剔除的请求与费用、未定价模型、作废段计数） |
+| `streams` | `instance, auth_index` | 增量处理位置（JSON）：游标、窗口跟踪、当前大块（含待作废标记）、`excluded`（被剔除的请求与费用、未定价模型、作废段计数） |
 | `segments` | `id` | 计入估算的 1% 段（作废段不写入）：`block_ns`（所属大块起点）、`at_ns`、`cost_usd`、`gain`（利用率增量）、`models`（按模型拆分的费用 JSON） |
 | `k_buckets` | `instance, auth_index, bucket_ns` | 每小时的 k 证据：`gain_5h`、`gain_7d` |
 | `blocks` | `instance, auth_index, start_at` | 当前估算的大块统计：段数、剔除数、增量 / 费用、干净增量 / 费用、参考比值及模式、是否干净 |
 | `estimates` | `instance, auth_index` | **当前估算快照，下游面板直接读这张**：列与额度接口账号对象的主要字段一致，`detail` 为完整账号对象 JSON |
 | `k_trend_daily` | `instance, auth_index, day` | 每日 k 趋势：`gain_5h`、`gain_7d`、当日 `k`、保留段数、剔除段数、干净段费用与增量 |
-| `model_weights` | `instance, provider` | 模型倍率结果：是否启用、`basis`、有效倍率、历史估算、各模型费用占比 |
+| `model_weights` | `instance` | 模型倍率结果：是否启用、`basis`、有效倍率、历史估算、各模型费用占比 |
 | `calibrations` | `id` | 模型倍率校准：`item`、`auth_index`、起止时间、`result` |
 
 ### 写失败与数据库不可用
@@ -197,7 +192,7 @@ CPA v8 的插件资源路由只支持 GET 且不做 CPA 自身的鉴权，所以
 | 字段 | 说明 |
 | --- | --- |
 | `plugin`, `version`, `instance`, `generated_at` | 插件 ID、版本、实例名、生成时间 |
-| `subscription`, `tier` | 配置的订阅类型与档位 |
+| `tier` | 配置的档位 |
 | `price_table` | `source_url`、`origin`（`remote` 本进程拉取 / `database` 库里的 / `none`）、`updated_at`（倍率表拉取时间）、`models`、`last_attempt_at`、`last_error` |
 | `database` | `status`（`ok` / `unavailable`）、`last_error`、`failed_at`、`pending_writes`、`dropped_writes`、`schema_version` |
 | `estimates` | `loaded`（是否已有基于数据库的估算）、`estimated_at`、`last_error` |
@@ -207,11 +202,9 @@ CPA v8 的插件资源路由只支持 GET 且不做 CPA 自身的鉴权，所以
 
 | 字段 | 说明 |
 | --- | --- |
-| `auth_index`, `provider`, `subscription`, `tier` | 账号、`claude` / `codex`、`claude` / `chatgpt`、档位 |
-| `state` | `cold`（冷启动）/ `estimated`（已估算）/ `paused`（额度用满或扣 credits，切段暂停） |
-| `pause_reason`, `paused_since` | `limit_reached` / `credits` 及开始时间，仅 `paused` 时出现 |
+| `auth_index`, `tier` | 账号、档位 |
+| `state` | `cold`（冷启动）/ `estimated`（已估算） |
 | `k`, `k_source`, `k_auto` | 生效的 k；来源 `manual` / `auto` / `default`（档位默认）/ `none`；估算出的 k |
-| `segment_window` | 切段测量的窗口：`5h`，或没有 5 小时窗口的账号为 `7d` |
 | `totals_from` | 总额来源：`estimated` 或 `tier`（档位默认） |
 | `safety_factor` | 安全系数 |
 | `observed_at` | 最近一次额度报告的时间 |
@@ -228,7 +221,6 @@ CPA v8 的插件资源路由只支持 GET 且不做 CPA 自身的鉴权，所以
   "version": "0.1.0",
   "instance": "cc-1",
   "generated_at": "2026-10-05T10:01:00Z",
-  "subscription": "claude",
   "tier": "max5x",
   "price_table": {
     "source_url": "https://toll.icmp.day/api/ratio_config",
@@ -242,14 +234,11 @@ CPA v8 的插件资源路由只支持 GET 且不做 CPA 自身的鉴权，所以
   "accounts": [
     {
       "auth_index": "acct-1",
-      "provider": "claude",
-      "subscription": "claude",
       "tier": "max5x",
       "state": "estimated",
       "k": 6.0,
       "k_source": "auto",
       "k_auto": 6.0,
-      "segment_window": "5h",
       "totals_from": "estimated",
       "safety_factor": 0.9,
       "observed_at": "2026-10-05T00:39:00Z",
@@ -304,7 +293,7 @@ Claude 以 `stop_reason: refusal`（或 `stop_details.type: refusal`、`category
 | 列 | 说明 |
 | --- | --- |
 | `instance`, `at_ns` / `at` | 实例、请求时间 |
-| `auth_index`, `provider`, `model` | 账号、`claude`、计费模型名 |
+| `auth_index`, `model` | 账号、计费模型名 |
 | `category`, `reason` | 拒绝类别（如 `cyber`，可为空）、原因 |
 | `request_id`, `status_code`, `stream` | CPA RequestID（去重键）、状态码、是否流式 |
 

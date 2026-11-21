@@ -2,13 +2,126 @@ package ccbilling
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 )
 
-// A request whose cost is unknown voids the segment it completes in; one
-// of another pool only leaves its cost out. Cost before a block's first
-// rise belongs to no segment, so an unknown one there voids nothing.
+type testRequest struct {
+	at      time.Time
+	latency time.Duration
+	usd     float64
+	model   string
+	source  string // price source; "none" means unpriced
+	usage   string // accounting quality; "" means complete
+	noUsage bool   // the request reported no usage
+	windows []testWindow
+}
+
+// insertRequests stores requests of an account the way the plugin records
+// them: a request, and a quota report with its windows when the response
+// reported any.
+func insertRequests(t *testing.T, host *fakeHost, authIndex string, requests []testRequest) {
+	t.Helper()
+	f := newFacts(t, host)
+	for _, request := range requests {
+		usage := request.usage
+		if usage == "" {
+			usage = "complete"
+		}
+		if request.noUsage {
+			usage = ""
+		}
+		f.requestUsage(authIndex, request.at, request.latency, request.usd, request.model, request.source != "none", usage)
+		if len(request.windows) > 0 {
+			f.report(authIndex, request.at, request.windows...)
+		}
+	}
+	f.flush()
+}
+
+func refreshedAccount(t *testing.T, manager *Manager, authIndex string) AccountView {
+	t.Helper()
+	if err := manager.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range manager.View().Accounts {
+		if account.AuthIndex == authIndex {
+			return account
+		}
+	}
+	t.Fatalf("account %s missing from %+v", authIndex, manager.View().Accounts)
+	return AccountView{}
+}
+
+// claudeSteady are requests of a Claude account whose 5-hour window rises
+// by one point for every $0.10 (5-hour total $10) and whose 7-day window by
+// one point for every $0.60 (weekly total $60), in blocks of busy minutes.
+func claudeSteady(start time.Time, blocks int) []testRequest {
+	var requests []testRequest
+	spent := 0.0
+	reset7 := start.Add(6 * 24 * time.Hour)
+	for block := 0; block < blocks; block++ {
+		blockStart := start.Add(time.Duration(block) * 2 * time.Hour)
+		reset5 := blockStart.Add(5 * time.Hour)
+		spent5 := 0.0
+		for i := 0; i < 30; i++ {
+			at := blockStart.Add(time.Duration(i) * time.Minute)
+			requests = append(requests, testRequest{at: at, latency: 10 * time.Second, usd: 0.05, model: "claude-test",
+				windows: []testWindow{{"unified", 604800, math.Floor(spent / 0.6), reset7}, {"unified", 18000, math.Floor(spent5 / 0.1), reset5}}})
+			spent += 0.05
+			spent5 += 0.05
+		}
+	}
+	return requests
+}
+
+// Reports with decimals cut segments where a whole point is crossed, and a
+// rise across several points makes one segment of that gain.
+func TestSegmentsCutAtWholePoints(t *testing.T) {
+	start := time.Date(2026, 10, 1, 8, 0, 0, 0, time.UTC)
+	reset5, reset7 := start.Add(4*time.Hour), start.Add(5*24*time.Hour)
+	used := []float64{10.2, 10.6, 11.3, 11.9, 12.4, 15.2, 15.9, 16.0}
+	var observations []Observation
+	var costs []CostEvent
+	for i, value := range used {
+		at := start.Add(time.Duration(i) * time.Minute)
+		observations = append(observations, Observation{At: at, Has5h: true, Used5h: value, Reset5h: reset5, Has7d: true, Used7d: 3, Reset7d: reset7})
+		costs = append(costs, CostEvent{At: at.Add(30 * time.Second), USD: float64(i + 1), Model: "claude-test"})
+	}
+	var state StreamState
+	state.Cursor = start.Add(-time.Second)
+	segments := state.Advance(observations, costs, start.Add(time.Hour), DefaultSettings().AccountParams())
+	// Armed at 11.3; the costs completed after it until 12.4 crosses 12
+	// (3+4); until 15.2 crosses 13-15 (5); until 16.0 crosses 16 (6+7).
+	want := []struct{ gain, cost float64 }{{12.4 - 11.3, 3 + 4}, {15.2 - 12.4, 5}, {16 - 15.2, 6 + 7}}
+	if len(segments) != len(want) {
+		t.Fatalf("segments = %+v", segments)
+	}
+	for i, segment := range segments {
+		if math.Abs(segment.Gain-want[i].gain) > 1e-6 || math.Abs(segment.CostUSD-want[i].cost) > 1e-9 {
+			t.Fatalf("segment %d = %+v, want %+v", i, segment, want[i])
+		}
+	}
+	// Whole-point reports behave as before: each rise is a segment.
+	var whole StreamState
+	whole.Cursor = start.Add(-time.Second)
+	var wholeObs []Observation
+	for i, value := range []float64{10, 11, 14, 15} {
+		wholeObs = append(wholeObs, Observation{At: start.Add(time.Duration(i) * time.Minute), Has5h: true, Used5h: value, Reset5h: reset5})
+	}
+	if segments := whole.Advance(wholeObs, costs[:3], start.Add(time.Hour), DefaultParams()); len(segments) != 2 || segments[0].Gain != 3 || segments[1].Gain != 1 {
+		t.Fatalf("whole segments = %+v", segments)
+	}
+	// A fraction times 100 that lands just below a whole point counts as it.
+	if !crossesPoint(28.000000000000004, 0.29*100) || crossesPoint(0.29*100, 29.4) {
+		t.Fatal("rounding of whole points")
+	}
+}
+
+// A request whose cost is unknown voids the segment it completes in. Cost
+// before a block's first rise belongs to no segment, so an unknown one there
+// voids nothing.
 func TestAdvanceVoidsSegmentsWithUnknownCost(t *testing.T) {
 	start := time.Date(2026, 10, 1, 8, 0, 0, 0, time.UTC)
 	reset5, reset7 := start.Add(4*time.Hour), start.Add(5*24*time.Hour)
@@ -25,8 +138,6 @@ func TestAdvanceVoidsSegmentsWithUnknownCost(t *testing.T) {
 	// In the segment 12% → 13%, twice: it is voided once.
 	costs = append(costs, CostEvent{At: start.Add(2*time.Minute + 40*time.Second), Model: "claude-new", Excluded: ExcludedUnpriced, Unpriced: true},
 		CostEvent{At: start.Add(2*time.Minute + 50*time.Second), Model: "claude-test", Excluded: ExcludedUnpriced})
-	// In the segment 14% → 15%, another pool's request.
-	costs = append(costs, CostEvent{At: start.Add(4*time.Minute + 40*time.Second), USD: 5, Model: "gpt-spark", Excluded: ExcludedOtherLimit})
 	var state StreamState
 	state.Cursor = start.Add(-time.Second)
 	segments := state.Advance(observations, costs, start.Add(time.Hour), DefaultParams())
@@ -44,25 +155,10 @@ func TestAdvanceVoidsSegmentsWithUnknownCost(t *testing.T) {
 	}
 	excluded := state.Excluded
 	if excluded.VoidedSegments[ExcludedUnpriced] != 1 || excluded.Voided() != 1 || excluded.Requests[ExcludedUnpriced] != 3 ||
-		excluded.Requests[ExcludedOtherLimit] != 1 || excluded.USD[ExcludedOtherLimit] != 5 || excluded.UnpricedModels["claude-new"] != 2 ||
+		excluded.UnpricedModels["claude-new"] != 2 ||
 		len(excluded.UnpricedModels) != 1 || state.Void != "" {
 		t.Fatalf("excluded = %+v, void %q", excluded, state.Void)
 	}
-}
-
-// claudeSteady is steadyRequests on a Claude account's unified windows.
-func claudeSteady(start time.Time, blocks int) []testRequest {
-	requests := steadyRequests(start, blocks, true, nil)
-	for i := range requests {
-		windows := make([]testWindow, len(requests[i].windows))
-		for j, window := range requests[i].windows {
-			window.limit = "unified"
-			windows[j] = window
-		}
-		requests[i].windows = windows
-		requests[i].model = "claude-test"
-	}
-	return requests
 }
 
 // On a Claude account, requests of an unpriced model or with incomplete
@@ -76,7 +172,7 @@ func TestClaudeSegmentsVoidUnknownCost(t *testing.T) {
 		host := newFakeHost(t)
 		manager := newTestManager(host)
 		configure(t, manager, settings, AccountSettings{Tier: TierMax5x}, "a1")
-		insertRequests(t, host, "a1", ProviderClaude, append(claudeSteady(start, 6), extra...))
+		insertRequests(t, host, "a1", append(claudeSteady(start, 6), extra...))
 		account := refreshedAccount(t, manager, "a1")
 		rows, err := host.db.Query(`SELECT at_ns, cost_usd, gain FROM segments WHERE instance = $1 AND auth_index = 'a1'`, testInstance)
 		if err != nil {
