@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  check:
+    name: Check the tagged source
+    uses: ./.github/workflows/check.yml
+    with:
+      ref: refs/tags/${{ inputs.tag || github.ref_name }}
+      expect_tag: ${{ inputs.tag || github.ref_name }}
+
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    # Linux libraries build in manylinux2014 (glibc 2.17) and, like Windows,
+    # pin a baseline instruction set so they load on older CPUs.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: ubuntu-24.04, ext: so, image: quay.io/pypa/manylinux2014_x86_64, cpu: GOAMD64=v1, march: x86-64 }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, ext: so, image: quay.io/pypa/manylinux2014_aarch64, cpu: GOARM64=v8.0, march: armv8-a }
+          - { os: darwin, arch: amd64, runner: macos-15-intel, ext: dylib }
+          - { os: darwin, arch: arm64, runner: macos-latest, ext: dylib }
+          - { os: windows, arch: amd64, runner: windows-2025, ext: dll, cpu: GOAMD64=v1, march: x86-64 }
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build (Linux)
+        if: matrix.os == 'linux'
+        env:
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+          CPU: ${{ matrix.cpu }}
+          MARCH: ${{ matrix.march }}
+        run: |
+          mkdir -p dist
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/src" -w /src -v "$(go env GOROOT):/opt/go:ro" \
+            -e HOME=/tmp -e GOROOT=/opt/go -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomod \
+            -e ARCH -e CPU -e MARCH "$IMAGE" bash -euo pipefail -c '
+              export PATH="$GOROOT/bin:$PATH" "$CPU" CGO_CFLAGS="-O2 -march=$MARCH"
+              CGO_ENABLED=1 GOOS=linux GOARCH="$ARCH" go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" \
+                -tags cshared -buildmode=c-shared -o dist/cpa-quota.so ./cmd/cpa-quota'
+
+      - name: Build (macOS)
+        if: matrix.os == 'darwin'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=darwin GOARCH="$ARCH" go build -trimpath -buildvcs=false -ldflags="-s -w" \
+            -tags cshared -buildmode=c-shared -o dist/cpa-quota.dylib ./cmd/cpa-quota
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          CPU: ${{ matrix.cpu }}
+          MARCH: ${{ matrix.march }}
+        run: |
+          mkdir -p dist
+          export "${CPU:?}" CGO_CFLAGS="-O2 -march=$MARCH" CC=gcc
+          CGO_ENABLED=1 GOOS=windows GOARCH="$ARCH" go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" \
+            -tags cshared -buildmode=c-shared -o dist/cpa-quota.dll ./cmd/cpa-quota
+
+      - name: Package
+        shell: bash
+        env:
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          rm -f dist/cpa-quota.h
+          test -s "dist/cpa-quota.$EXT"
+          version="${TAG#v}"
+          # CLIProxyAPI's plugin store installs <id>_<version>_<os>_<arch>.zip.
+          archive="cpa-quota_${version}_${OS}_${ARCH}"
+          if command -v zip >/dev/null 2>&1; then
+            zip -j "$archive.zip" "dist/cpa-quota.$EXT"
+          else
+            (cd dist && 7z a -tzip "../$archive.zip" "cpa-quota.$EXT" >/dev/null)
+          fi
+          if [ "$OS" != windows ]; then
+            tar -czf "$archive.tar.gz" -C dist "cpa-quota.$EXT"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            cpa-quota_*.zip
+            cpa-quota_*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: package-*
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums and release notes
+        run: |
+          (cd assets && sha256sum cpa-quota_* | sort -k 2 > checksums.txt)
+          awk -v heading="## $TAG" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' Changelog.md > notes.md
+          test -s notes.md
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          body_path: notes.md
+          files: |
+            assets/cpa-quota_*
+            assets/checksums.txt
+          fail_on_unmatched_files: true
+          overwrite_files: true

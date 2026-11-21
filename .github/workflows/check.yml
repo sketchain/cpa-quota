@@ -1,0 +1,92 @@
+name: Check
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to check out instead of the triggering one.
+        type: string
+        default: ""
+      expect_tag:
+        description: When set, the plugin version must equal this tag without its leading v.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, vet and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CPA_QUOTA_TEST_DSN: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Plugin version matches the tag
+        if: inputs.expect_tag != ''
+        env:
+          EXPECT_TAG: ${{ inputs.expect_tag }}
+        run: |
+          version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' internal/plugin/types.go)"
+          test "v$version" = "$EXPECT_TAG"
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      - name: Build the plugin library
+        run: CGO_ENABLED=1 go build -tags cshared -buildmode=c-shared -o /tmp/cpa-quota.so ./cmd/cpa-quota
+
+      - name: Shell and Python scripts parse
+        run: |
+          bash -n scripts/e2e_cpa_quota.sh
+          python3 -m py_compile scripts/dummy_upstream.py
+
+      - name: actionlint
+        env:
+          GOTOOLCHAIN: auto
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
